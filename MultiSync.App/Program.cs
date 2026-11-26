@@ -14,7 +14,12 @@ public static class Program
             return 0;
         }
 
-        // Best-effort install/start of LocalSystem helper so Slave input works on UAC Secure Desktop & Lock Screen
+        if (args.Contains("--input-session", StringComparer.OrdinalIgnoreCase))
+        {
+            return SystemSessionInputWorker.Run();
+        }
+
+        // Best-effort install/start of LocalSystem helper (spawns Session-1 SYSTEM worker for UAC & Lock Screen)
         SystemInputServiceInstaller.EnsureInstalledAndRunning();
 
         var app = new App();

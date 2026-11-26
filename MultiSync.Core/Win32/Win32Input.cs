@@ -305,6 +305,7 @@ public sealed class MasterInputCapture : IDisposable
 
     private volatile bool _isCapturingRemote;
     private volatile bool _awaitingParkArrival;
+    private long _ignoreParkEchoUntilTick;
     private int _parkX = 960;
     private int _parkY = 540;
 
@@ -346,6 +347,7 @@ public sealed class MasterInputCapture : IDisposable
     {
         _isCapturingRemote = false;
         _awaitingParkArrival = false;
+        _ignoreParkEchoUntilTick = Environment.TickCount64 + 80;
         ShowShield(false);
         Win32Native.SetCursorPos(landingX, landingY);
     }
@@ -439,8 +441,19 @@ public sealed class MasterInputCapture : IDisposable
                 if (dx != 0 || dy != 0)
                 {
                     RemoteMouseDelta?.Invoke(dx, dy);
-                    Win32Native.SetCursorPos(_parkX, _parkY);
+                    // Only re-center if we are STILL on the remote screen!
+                    // If RemoteMouseDelta returned to the local Master screen, ExitRemoteCapture already
+                    // placed the cursor at the entry edge — re-centering here would teleport it to center!
+                    if (_isCapturingRemote)
+                        Win32Native.SetCursorPos(_parkX, _parkY);
                 }
+                return 1;
+            }
+
+            // Swallow any stale queued mouse move still stamped near the old park point right after returning
+            if (Environment.TickCount64 <= _ignoreParkEchoUntilTick &&
+                Math.Abs(info.Pt.X - _parkX) <= 4 && Math.Abs(info.Pt.Y - _parkY) <= 4)
+            {
                 return 1;
             }
 

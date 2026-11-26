@@ -4,15 +4,17 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
 
 namespace MultiSync.Core.Win32;
 
 /// <summary>
-/// Runs as NT AUTHORITY\SYSTEM (--input-service) and attaches a dedicated worker thread to whichever
-/// Windows desktop is currently receiving input (Default desktop, UAC Secure Desktop Winlogon, or Lock Screen),
-/// allowing mouse &amp; keyboard control even over UAC permission dialogs and elevated system prompts.
+/// Windows Service running as LocalSystem in Session 0 (--input-service).
+/// Because Windows enforces Session 0 Isolation, this service duplicates its LocalSystem token into
+/// the active interactive console session (e.g. Session 1) and launches "--input-session" on WinSta0,
+/// giving the child process full SYSTEM privileges on BOTH WinSta0\Default and WinSta0\Winlogon (UAC / Lock Screen).
 /// </summary>
 public sealed class SystemInputWindowsService : ServiceBase
 {
@@ -20,9 +22,8 @@ public sealed class SystemInputWindowsService : ServiceBase
     public const string PipeName = "MultiSync.SystemInput.v1";
 
     private CancellationTokenSource? _cts;
-    private Thread? _desktopWorker;
-    private Task? _pipeServerTask;
-    private readonly BlockingCollection<byte[]> _commandQueue = new(boundedCapacity: 4096);
+    private Task? _watchdogTask;
+    private int _childPid;
 
     public SystemInputWindowsService()
     {
@@ -35,37 +36,224 @@ public sealed class SystemInputWindowsService : ServiceBase
     {
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
-
-        _desktopWorker = new Thread(() => DesktopInjectionLoop(token))
-        {
-            Name = "MultiSync.SystemDesktopInjector",
-            IsBackground = true,
-            Priority = ThreadPriority.Highest,
-        };
-        _desktopWorker.Start();
-
-        _pipeServerTask = Task.Run(() => PipeAcceptLoopAsync(token), token);
+        _watchdogTask = Task.Run(() => SessionChildWatchdogAsync(token), token);
     }
 
     protected override void OnStop()
     {
         _cts?.Cancel();
-        _commandQueue.CompleteAdding();
-        try { _desktopWorker?.Join(TimeSpan.FromSeconds(2)); } catch { }
-        try { _pipeServerTask?.Wait(TimeSpan.FromSeconds(2)); } catch { }
+        KillChild();
+        try { _watchdogTask?.Wait(TimeSpan.FromSeconds(2)); } catch { }
         _cts?.Dispose();
     }
 
-    private async Task PipeAcceptLoopAsync(CancellationToken cancel)
+    private async Task SessionChildWatchdogAsync(CancellationToken cancel)
+    {
+        uint activeSessionForChild = uint.MaxValue;
+
+        while (!cancel.IsCancellationRequested)
+        {
+            try
+            {
+                var consoleSession = WTSGetActiveConsoleSessionId();
+                if (consoleSession != 0xFFFFFFFF && consoleSession != 0)
+                {
+                    var alive = IsChildAlive(_childPid);
+                    if (!alive || activeSessionForChild != consoleSession)
+                    {
+                        KillChild();
+                        if (LaunchSessionChild(consoleSession, out var newPid))
+                        {
+                            _childPid = newPid;
+                            activeSessionForChild = consoleSession;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // retry on next tick
+            }
+
+            try { await Task.Delay(1500, cancel); }
+            catch (OperationCanceledException) { break; }
+        }
+
+        KillChild();
+    }
+
+    private static bool IsChildAlive(int pid)
+    {
+        if (pid <= 0) return false;
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void KillChild()
+    {
+        var pid = Interlocked.Exchange(ref _childPid, 0);
+        if (pid <= 0) return;
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            if (!p.HasExited) p.Kill(entireProcessTree: true);
+        }
+        catch { }
+    }
+
+    private static bool LaunchSessionChild(uint sessionId, out int pid)
+    {
+        pid = 0;
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(exePath)) return false;
+
+        nint myToken = nint.Zero;
+        nint dupToken = nint.Zero;
+        try
+        {
+            const uint TOKEN_ALL_ACCESS = 0xF01FF;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, out myToken))
+                return false;
+
+            const uint MAXIMUM_ALLOWED = 0x02000000;
+            if (!DuplicateTokenEx(myToken, MAXIMUM_ALLOWED, nint.Zero, 2 /* SecurityImpersonation */, 1 /* TokenPrimary */, out dupToken))
+                return false;
+
+            // Retarget our LocalSystem primary token to the active interactive console session (e.g. Session 1)
+            if (!SetTokenInformation(dupToken, 12 /* TokenSessionId */, ref sessionId, sizeof(uint)))
+                return false;
+
+            var si = new STARTUPINFO
+            {
+                cb = Marshal.SizeOf<STARTUPINFO>(),
+                lpDesktop = @"winsta0\default",
+            };
+
+            const uint CREATE_NO_WINDOW = 0x08000000;
+            const uint HIGH_PRIORITY_CLASS = 0x00000080;
+            var cmdLine = $"\"{exePath}\" --input-session";
+
+            if (!CreateProcessAsUserW(
+                    dupToken,
+                    exePath,
+                    cmdLine,
+                    nint.Zero,
+                    nint.Zero,
+                    false,
+                    CREATE_NO_WINDOW | HIGH_PRIORITY_CLASS,
+                    nint.Zero,
+                    Path.GetDirectoryName(exePath),
+                    ref si,
+                    out var pi))
+            {
+                return false;
+            }
+
+            pid = pi.dwProcessId;
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return true;
+        }
+        finally
+        {
+            if (dupToken != nint.Zero) CloseHandle(dupToken);
+            if (myToken != nint.Zero) CloseHandle(myToken);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string? lpReserved;
+        public string? lpDesktop;
+        public string? lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public nint lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public nint hProcess;
+        public nint hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WTSGetActiveConsoleSessionId();
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(nint processHandle, uint desiredAccess, out nint tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateTokenEx(
+        nint existingToken, uint desiredAccess, nint tokenAttributes, int impersonationLevel, int tokenType, out nint newToken);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetTokenInformation(nint tokenHandle, int tokenInformationClass, ref uint tokenInformation, uint tokenInformationLength);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcessAsUserW(
+        nint token, string? applicationName, string commandLine, nint procAttrs, nint threadAttrs,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandles, uint creationFlags, nint environment,
+        string? currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION procInfo);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(nint handle);
+}
+
+/// <summary>
+/// Runs as NT AUTHORITY\SYSTEM INSIDE the interactive user session (Session 1 / WinSta0) via "--input-session".
+/// Switches its dedicated injector thread seamlessly between WinSta0\Default and WinSta0\Winlogon (UAC / Lock Screen)
+/// so Slave mouse &amp; keyboard input NEVER freezes when permission prompts or admin dialogs appear.
+/// </summary>
+public static class SystemSessionInputWorker
+{
+    public static int Run()
+    {
+        using var cts = new CancellationTokenSource();
+        using var queue = new BlockingCollection<byte[]>(boundedCapacity: 4096);
+
+        var desktopWorker = new Thread(() => DesktopInjectionLoop(queue, cts.Token))
+        {
+            Name = "MultiSync.Session1SystemInjector",
+            IsBackground = false,
+            Priority = ThreadPriority.Highest,
+        };
+        desktopWorker.Start();
+
+        PipeAcceptLoopAsync(queue, cts.Token).GetAwaiter().GetResult();
+        return 0;
+    }
+
+    private static async Task PipeAcceptLoopAsync(BlockingCollection<byte[]> queue, CancellationToken cancel)
     {
         while (!cancel.IsCancellationRequested)
         {
             NamedPipeServerStream? pipe = null;
             try
             {
-                pipe = CreateSecurePipeServer();
+                pipe = CreatePipeServer();
                 await pipe.WaitForConnectionAsync(cancel);
-                _ = HandlePipeClientAsync(pipe, cancel);
+                _ = HandlePipeClientAsync(pipe, queue, cancel);
             }
             catch (OperationCanceledException) when (cancel.IsCancellationRequested)
             {
@@ -75,12 +263,12 @@ public sealed class SystemInputWindowsService : ServiceBase
             catch
             {
                 pipe?.Dispose();
-                try { await Task.Delay(500, cancel); } catch { break; }
+                try { await Task.Delay(300, cancel); } catch { break; }
             }
         }
     }
 
-    private async Task HandlePipeClientAsync(NamedPipeServerStream pipe, CancellationToken cancel)
+    private static async Task HandlePipeClientAsync(NamedPipeServerStream pipe, BlockingCollection<byte[]> queue, CancellationToken cancel)
     {
         await using (pipe)
         {
@@ -92,7 +280,7 @@ public sealed class SystemInputWindowsService : ServiceBase
                     await pipe.ReadExactlyAsync(buf, cancel);
                     var copy = new byte[12];
                     Buffer.BlockCopy(buf, 0, copy, 0, 12);
-                    _commandQueue.TryAdd(copy);
+                    queue.TryAdd(copy);
                 }
                 catch
                 {
@@ -102,7 +290,7 @@ public sealed class SystemInputWindowsService : ServiceBase
         }
     }
 
-    private static NamedPipeServerStream CreateSecurePipeServer()
+    private static NamedPipeServerStream CreatePipeServer()
     {
         var security = new PipeSecurity();
         security.AddAccessRule(new PipeAccessRule(
@@ -119,7 +307,7 @@ public sealed class SystemInputWindowsService : ServiceBase
             AccessControlType.Allow));
 
         return NamedPipeServerStreamAcl.Create(
-            PipeName,
+            SystemInputWindowsService.PipeName,
             PipeDirection.In,
             NamedPipeServerStream.MaxAllowedServerInstances,
             PipeTransmissionMode.Byte,
@@ -129,35 +317,35 @@ public sealed class SystemInputWindowsService : ServiceBase
             security);
     }
 
-    private void DesktopInjectionLoop(CancellationToken cancel)
+    private static void DesktopInjectionLoop(BlockingCollection<byte[]> queue, CancellationToken cancel)
     {
         var inputSize = Marshal.SizeOf<Win32Native.INPUT>();
-        long lastDesktopCheckTick = 0;
+        long lastCheckTick = 0;
         nint currentDesktop = nint.Zero;
 
         try
         {
-            foreach (var cmd in _commandQueue.GetConsumingEnumerable(cancel))
+            foreach (var cmd in queue.GetConsumingEnumerable(cancel))
             {
                 var now = Environment.TickCount64;
-                if (now - lastDesktopCheckTick >= 100 || currentDesktop == nint.Zero)
+                if (now - lastCheckTick >= 80 || currentDesktop == nint.Zero)
                 {
-                    lastDesktopCheckTick = now;
+                    lastCheckTick = now;
                     AttachToActiveInputDesktop(ref currentDesktop);
                 }
 
-                var sent = ExecuteRawCommand(cmd, inputSize);
+                var sent = ExecuteCommand(cmd, inputSize);
                 if (sent == 0)
                 {
-                    // Active desktop just switched (e.g. UAC Winlogon just appeared) — reattach immediately and retry!
+                    // Desktop transitioned (Default <-> Winlogon UAC) — switch immediately and retry!
                     AttachToActiveInputDesktop(ref currentDesktop);
-                    _ = ExecuteRawCommand(cmd, inputSize);
+                    _ = ExecuteCommand(cmd, inputSize);
                 }
             }
         }
         catch (OperationCanceledException)
         {
-            // normal stop
+            // stop
         }
         finally
         {
@@ -186,12 +374,9 @@ public sealed class SystemInputWindowsService : ServiceBase
         }
     }
 
-    private static uint ExecuteRawCommand(byte[] cmd, int inputSize)
+    private static uint ExecuteCommand(byte[] cmd, int inputSize)
     {
-        // Fixed 12-byte wire command:
-        // [0] = op (1 = mouseAbsNorm, 2 = mouseBtn, 3 = mouseWheel, 4 = key)
-        var op = cmd[0];
-        switch (op)
+        switch (cmd[0])
         {
             case 1:
             {
@@ -290,7 +475,7 @@ public static class SystemInputBridgeClient
             if (_pipe is not { IsConnected: true })
             {
                 var now = Environment.TickCount64;
-                if (now - _lastConnectAttemptTick < 2000)
+                if (now - _lastConnectAttemptTick < 1500)
                     return false;
                 _lastConnectAttemptTick = now;
 
@@ -342,8 +527,7 @@ public static class SystemInputServiceInstaller
             Directory.CreateDirectory(hostDir);
             var serviceExe = Path.Combine(hostDir, "MultiSyncServiceHost.exe");
 
-            var needsBinaryCopy = !File.Exists(serviceExe) ||
-                                  new FileInfo(serviceExe).Length != new FileInfo(currentExe).Length;
+            var needsBinaryCopy = !FilesMatchByHash(currentExe, serviceExe);
 
             using var existing = ServiceController.GetServices()
                 .FirstOrDefault(s => string.Equals(s.ServiceName, SystemInputWindowsService.ServiceNameConst, StringComparison.OrdinalIgnoreCase));
@@ -354,6 +538,13 @@ public static class SystemInputServiceInstaller
                 {
                     existing.Stop();
                     existing.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(5));
+                }
+
+                // Make sure any Session-1 child host process exits so MultiSyncServiceHost.exe can be overwritten
+                foreach (var p in Process.GetProcessesByName("MultiSyncServiceHost"))
+                {
+                    try { p.Kill(entireProcessTree: true); p.WaitForExit(1500); } catch { }
+                    finally { p.Dispose(); }
                 }
             }
 
@@ -373,6 +564,15 @@ public static class SystemInputServiceInstaller
         {
             // Non-fatal: falls back to direct elevated SendInput
         }
+    }
+
+    private static bool FilesMatchByHash(string pathA, string pathB)
+    {
+        if (!File.Exists(pathA) || !File.Exists(pathB)) return false;
+        if (new FileInfo(pathA).Length != new FileInfo(pathB).Length) return false;
+        using var fsA = File.OpenRead(pathA);
+        using var fsB = File.OpenRead(pathB);
+        return SHA256.HashData(fsA).AsSpan().SequenceEqual(SHA256.HashData(fsB));
     }
 
     private static void RunSc(string arguments)
