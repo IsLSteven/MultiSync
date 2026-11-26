@@ -1,3 +1,4 @@
+using MultiSync.Core.ClipboardSync;
 using MultiSync.Core.Models;
 using MultiSync.Core.Topology;
 using NUnit.Framework;
@@ -77,5 +78,30 @@ public class TopologyCompilerTests
         // Crossing Down edge at (400, 1079) -> lands at Top edge (x=400, y=2) on destination!
         var fromDown = TopologyCompiler.ComputeEntryPoint(ScreenSide.Down, 400, 1079, 0, 0, 1920, 1080, 1920, 1080);
         Assert.That(fromDown, Is.EqualTo((400, 2)));
+    }
+
+    [Test]
+    public void BuildFileManifest_CapturesFilesAndNestedFolders()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "MultiSyncTest_" + Guid.NewGuid().ToString("N")[..8]);
+        var sub = Path.Combine(tempRoot, "PastaTeste", "Sub");
+        Directory.CreateDirectory(sub);
+        var f1 = Path.Combine(tempRoot, "PastaTeste", "a.txt");
+        var f2 = Path.Combine(sub, "b.txt");
+        File.WriteAllText(f1, "hello");
+        File.WriteAllText(f2, "world!");
+
+        try
+        {
+            var built = ClipboardSyncManager.BuildFileManifest([Path.Combine(tempRoot, "PastaTeste")]);
+            Assert.That(built, Is.Not.Null);
+            Assert.That(built!.Value.Manifest.TotalBytes, Is.EqualTo(11));
+            Assert.That(built.Value.Manifest.Entries.Any(e => e.IsDirectory && e.RelativePath == "PastaTeste"), Is.True);
+            Assert.That(built.Value.FullPathByRelative.Count, Is.EqualTo(2));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
     }
 }

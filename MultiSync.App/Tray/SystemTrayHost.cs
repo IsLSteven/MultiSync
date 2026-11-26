@@ -35,6 +35,12 @@ public sealed class SystemTrayHost : IDisposable
         _notifyIcon.DoubleClick += (_, _) => onShowWindow();
     }
 
+    public void ShowInfo(string title, string message)
+    {
+        try { _notifyIcon.ShowBalloonTip(2500, title, message, WinForms.ToolTipIcon.Info); }
+        catch { }
+    }
+
     private static Icon BuildVectorIcon()
     {
         using var bmp = new Bitmap(32, 32);

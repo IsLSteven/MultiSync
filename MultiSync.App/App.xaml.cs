@@ -37,6 +37,12 @@ public partial class App : System.Windows.Application
             onToggleLock: () => _coordinator.Engine.ToggleCursorLock(),
             onExitApp: ShutdownAll);
 
+        _coordinator.Engine.TransferActivity += msg =>
+        {
+            if (msg.Contains("Ctrl+V", StringComparison.OrdinalIgnoreCase))
+                _tray?.ShowInfo("MultiSync", msg);
+        };
+
         _coordinator.StartAll();
 
         if (!e.Args.Contains("--minimized"))

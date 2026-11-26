@@ -20,6 +20,7 @@ public static class Win32Native
     public const int WM_KEYUP = 0x0101;
     public const int WM_SYSKEYDOWN = 0x0104;
     public const int WM_SYSKEYUP = 0x0105;
+    public const int WM_INPUT = 0x00FF;
 
     public const int WM_MOUSEMOVE = 0x0200;
     public const int WM_LBUTTONDOWN = 0x0201;
@@ -56,11 +57,17 @@ public static class Win32Native
     public const uint KEYEVENTF_UNICODE = 0x0004;
 
     public const uint LLKHF_EXTENDED = 0x01;
-    public const uint LLKHF_INJECTED = 0x10;
-    public const uint LLMHF_INJECTED = 0x01;
 
+    public const int VK_SHIFT = 0x10;
     public const int VK_CONTROL = 0x11;
     public const int VK_MENU = 0x12;
+    public const int VK_CAPITAL = 0x14;
+    public const int VK_LSHIFT = 0xA0;
+    public const int VK_RSHIFT = 0xA1;
+    public const int VK_LCONTROL = 0xA2;
+    public const int VK_RCONTROL = 0xA3;
+    public const int VK_LMENU = 0xA4;
+    public const int VK_RMENU = 0xA5;
     public const int VK_LWIN = 0x5B;
     public const int VK_RWIN = 0x5C;
     public const int VK_LEFT = 0x25;
@@ -76,6 +83,11 @@ public static class Win32Native
 
     public const uint MONITOR_DEFAULTTONEAREST = 2;
     public const uint DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+
+    public const uint RIDEV_INPUTSINK = 0x00000100;
+    public const uint RID_INPUT = 0x10000003;
+    public const uint RIM_TYPEMOUSE = 0;
+    public const ushort MOUSE_MOVE_ABSOLUTE = 0x01;
 
     public delegate nint LowLevelProc(int nCode, nint wParam, nint lParam);
 
@@ -154,6 +166,42 @@ public static class Win32Native
         [FieldOffset(8)] public KEYBDINPUT Ki;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTDEVICE
+    {
+        public ushort UsagePage;
+        public ushort Usage;
+        public uint Flags;
+        public nint Target;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTHEADER
+    {
+        public uint Type;
+        public uint Size;
+        public nint Device;
+        public nint WParam;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct RAWMOUSE
+    {
+        [FieldOffset(0)] public ushort Flags;
+        [FieldOffset(4)] public uint Buttons;
+        [FieldOffset(8)] public uint RawButtons;
+        [FieldOffset(12)] public int LastX;
+        [FieldOffset(16)] public int LastY;
+        [FieldOffset(20)] public uint ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUT_MOUSE
+    {
+        public RAWINPUTHEADER Header;
+        public RAWMOUSE Mouse;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern nint SetWindowsHookExW(int idHook, LowLevelProc lpfn, nint hMod, uint dwThreadId);
 
@@ -186,10 +234,6 @@ public static class Win32Native
     public static extern bool SetCursorPos(int x, int y);
 
     [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetCursorPos(out POINT pt);
-
-    [DllImport("user32.dll")]
     public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
     [DllImport("user32.dll")]
@@ -197,6 +241,9 @@ public static class Win32Native
 
     [DllImport("user32.dll")]
     public static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")]
+    public static extern short GetKeyState(int nVirtKey);
 
     [DllImport("user32.dll")]
     public static extern nint GetForegroundWindow();
@@ -233,10 +280,6 @@ public static class Win32Native
     public static extern int DwmGetWindowAttribute(nint hwnd, uint attr, out RECT rect, int cbAttribute);
 
     [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetKeyboardState(byte[] lpKeyState);
-
-    [DllImport("user32.dll")]
     public static extern nint GetKeyboardLayout(uint idThread);
 
     [DllImport("user32.dll")]
@@ -248,10 +291,13 @@ public static class Win32Native
         [Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pwszBuff,
         int cchBuff, uint wFlags, nint dwhkl);
 
-    /// <summary>
-    /// Detects whether a fullscreen or borderless-fullscreen application (e.g. League of Legends)
-    /// is currently focused, ignoring Windows Desktop, Taskbar, and standard maximized windows.
-    /// </summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] pRawInputDevices, uint uiNumDevices, uint cbSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint GetRawInputData(nint hRawInput, uint uiCommand, out RAWINPUT_MOUSE pData, ref uint pcbSize, uint cbSizeHeader);
+
     public static unsafe bool IsFullscreenWindowFocused()
     {
         var hwnd = GetForegroundWindow();
@@ -300,14 +346,15 @@ public sealed class MasterInputCapture : IDisposable
     private nint _kbdHook;
     private Win32Native.LowLevelProc? _mouseDelegate;
     private Win32Native.LowLevelProc? _kbdDelegate;
-    private Form? _cursorShieldForm;
+    private RawMouseMessageWindow? _rawWindow;
     private readonly ManualResetEventSlim _ready = new();
 
     private volatile bool _isCapturingRemote;
-    private volatile bool _awaitingParkArrival;
-    private long _ignoreParkEchoUntilTick;
-    private int _parkX = 960;
-    private int _parkY = 540;
+    private long _ignoreLocalEdgeUntilTick;
+
+    // Track physical modifier state on our hook thread (because WH_KEYBOARD_LL swallows modifiers
+    // while capturing remote, so GetAsyncKeyState would falsely report them as NOT held!)
+    private bool _lCtrlDown, _rCtrlDown, _lAltDown, _rAltDown, _lShiftDown, _rShiftDown, _lWinDown, _rWinDown;
 
     public event Action<int, int>? LocalCursorMoved;
     public event Action<int, int>? RemoteMouseDelta;
@@ -333,48 +380,35 @@ public sealed class MasterInputCapture : IDisposable
         _ready.Wait(TimeSpan.FromSeconds(3));
     }
 
-    public void EnterRemoteCapture(int parkX, int parkY)
+    /// <summary>
+    /// Parks the Master cursor cleanly right at the edge pixel (edgeX, edgeY) where the user crossed,
+    /// swallows local WM_MOUSEMOVE so the cursor stays completely stationary at that edge,
+    /// and streams true unclamped hardware mouse deltas via WM_INPUT Raw Input!
+    /// </summary>
+    public void EnterRemoteCapture(int edgeX, int edgeY)
     {
-        _parkX = parkX;
-        _parkY = parkY;
-        _awaitingParkArrival = true;
         _isCapturingRemote = true;
-        Win32Native.SetCursorPos(parkX, parkY);
-        ShowShield(true);
+        Win32Native.SetCursorPos(edgeX, edgeY);
     }
 
     public void ExitRemoteCapture(int landingX, int landingY)
     {
+        ReleaseHeldModifiersOnRemote();
         _isCapturingRemote = false;
-        _awaitingParkArrival = false;
-        _ignoreParkEchoUntilTick = Environment.TickCount64 + 80;
-        ShowShield(false);
+        _ignoreLocalEdgeUntilTick = Environment.TickCount64 + 80;
         Win32Native.SetCursorPos(landingX, landingY);
     }
 
-    private void ShowShield(bool visible)
+    private void ReleaseHeldModifiersOnRemote()
     {
-        var form = _cursorShieldForm;
-        if (form == null || form.IsDisposed) return;
-        try
-        {
-            form.BeginInvoke(() =>
-            {
-                if (visible)
-                {
-                    form.Location = new System.Drawing.Point(_parkX - 60, _parkY - 60);
-                    if (!form.Visible) form.Show();
-                }
-                else if (form.Visible)
-                {
-                    form.Hide();
-                }
-            });
-        }
-        catch
-        {
-            // ignore shutdown race
-        }
+        if (_lCtrlDown) { _lCtrlDown = false; RemoteKey?.Invoke(Win32Native.VK_LCONTROL, 0x1D, false, false, '\0'); }
+        if (_rCtrlDown) { _rCtrlDown = false; RemoteKey?.Invoke(Win32Native.VK_RCONTROL, 0x1D, false, true, '\0'); }
+        if (_lAltDown) { _lAltDown = false; RemoteKey?.Invoke(Win32Native.VK_LMENU, 0x38, false, false, '\0'); }
+        if (_rAltDown) { _rAltDown = false; RemoteKey?.Invoke(Win32Native.VK_RMENU, 0x38, false, true, '\0'); }
+        if (_lShiftDown) { _lShiftDown = false; RemoteKey?.Invoke(Win32Native.VK_LSHIFT, 0x2A, false, false, '\0'); }
+        if (_rShiftDown) { _rShiftDown = false; RemoteKey?.Invoke(Win32Native.VK_RSHIFT, 0x36, false, false, '\0'); }
+        if (_lWinDown) { _lWinDown = false; RemoteKey?.Invoke(Win32Native.VK_LWIN, 0x5B, false, true, '\0'); }
+        if (_rWinDown) { _rWinDown = false; RemoteKey?.Invoke(Win32Native.VK_RWIN, 0x5C, false, true, '\0'); }
     }
 
     private void PumpLoop()
@@ -383,9 +417,8 @@ public sealed class MasterInputCapture : IDisposable
         _mouseDelegate = MouseCallback;
         _kbdDelegate = KeyboardCallback;
 
-        // Invisible window under park point that hides cursor via Cursor.Hide() only over itself — never touches SetSystemCursor!
-        _cursorShieldForm = new CursorBlankWindow();
-        _ = _cursorShieldForm.Handle;
+        _rawWindow = new RawMouseMessageWindow(OnRawMouseDelta);
+        _ = _rawWindow.Handle;
 
         _mouseHook = Win32Native.SetWindowsHookExW(Win32Native.WH_MOUSE_LL, _mouseDelegate, nint.Zero, 0);
         _kbdHook = Win32Native.SetWindowsHookExW(Win32Native.WH_KEYBOARD_LL, _kbdDelegate, nint.Zero, 0);
@@ -399,7 +432,14 @@ public sealed class MasterInputCapture : IDisposable
 
         if (_mouseHook != nint.Zero) Win32Native.UnhookWindowsHookEx(_mouseHook);
         if (_kbdHook != nint.Zero) Win32Native.UnhookWindowsHookEx(_kbdHook);
-        _cursorShieldForm?.Dispose();
+        _rawWindow?.Dispose();
+    }
+
+    private void OnRawMouseDelta(int dx, int dy)
+    {
+        if (!_isCapturingRemote) return;
+        if (dx == 0 && dy == 0) return;
+        RemoteMouseDelta?.Invoke(dx, dy);
     }
 
     private unsafe nint MouseCallback(int nCode, nint wParam, nint lParam)
@@ -414,50 +454,14 @@ public sealed class MasterInputCapture : IDisposable
         {
             if (_isCapturingRemote)
             {
-                if (info.Pt.X == _parkX && info.Pt.Y == _parkY)
-                {
-                    _awaitingParkArrival = false;
-                    return 1;
-                }
-
-                // Discard pre-warp mouse samples queued near the screen edge before SetCursorPos(_parkX, _parkY)
-                // landed; otherwise (edgeX - parkX) adds ~960px and teleports the remote cursor to screen center!
-                if (_awaitingParkArrival)
-                {
-                    Win32Native.SetCursorPos(_parkX, _parkY);
-                    return 1;
-                }
-
-                var dx = info.Pt.X - _parkX;
-                var dy = info.Pt.Y - _parkY;
-
-                // Guard against any late OS warp-echo spike (> 350px in a single USB sample)
-                if (Math.Abs(dx) > 350 || Math.Abs(dy) > 350)
-                {
-                    Win32Native.SetCursorPos(_parkX, _parkY);
-                    return 1;
-                }
-
-                if (dx != 0 || dy != 0)
-                {
-                    RemoteMouseDelta?.Invoke(dx, dy);
-                    // Only re-center if we are STILL on the remote screen!
-                    // If RemoteMouseDelta returned to the local Master screen, ExitRemoteCapture already
-                    // placed the cursor at the entry edge — re-centering here would teleport it to center!
-                    if (_isCapturingRemote)
-                        Win32Native.SetCursorPos(_parkX, _parkY);
-                }
+                // Swallow local cursor movement so the Master cursor stays glued right on the crossing edge!
+                // Actual mouse motion is captured cleanly via unclamped WM_INPUT Raw Input.
                 return 1;
             }
 
-            // Swallow any stale queued mouse move still stamped near the old park point right after returning
-            if (Environment.TickCount64 <= _ignoreParkEchoUntilTick &&
-                Math.Abs(info.Pt.X - _parkX) <= 4 && Math.Abs(info.Pt.Y - _parkY) <= 4)
-            {
-                return 1;
-            }
+            if (Environment.TickCount64 > _ignoreLocalEdgeUntilTick)
+                LocalCursorMoved?.Invoke(info.Pt.X, info.Pt.Y);
 
-            LocalCursorMoved?.Invoke(info.Pt.X, info.Pt.Y);
             return Win32Native.CallNextHookEx(nint.Zero, nCode, wParam, lParam);
         }
 
@@ -499,6 +503,9 @@ public sealed class MasterInputCapture : IDisposable
         var isDown = msg is Win32Native.WM_KEYDOWN or Win32Native.WM_SYSKEYDOWN;
         var isUp = msg is Win32Native.WM_KEYUP or Win32Native.WM_SYSKEYUP;
 
+        if (isDown || isUp)
+            UpdateTrackedModifier(info.VkCode, isDown);
+
         // Global Hotkeys: Ctrl + Alt + Win + (L or Arrows)
         if (isDown && IsCtrlAltWinHeld())
         {
@@ -525,27 +532,64 @@ public sealed class MasterInputCapture : IDisposable
         return 1;
     }
 
-    private static bool IsCtrlAltWinHeld() =>
-        (Win32Native.GetAsyncKeyState(Win32Native.VK_CONTROL) & 0x8000) != 0 &&
-        (Win32Native.GetAsyncKeyState(Win32Native.VK_MENU) & 0x8000) != 0 &&
-        ((Win32Native.GetAsyncKeyState(Win32Native.VK_LWIN) & 0x8000) != 0 ||
-         (Win32Native.GetAsyncKeyState(Win32Native.VK_RWIN) & 0x8000) != 0);
-
-    private static char ResolveUnicodeChar(uint vk, uint scan)
+    private void UpdateTrackedModifier(uint vk, bool down)
     {
-        if ((Win32Native.GetAsyncKeyState(Win32Native.VK_CONTROL) & 0x8000) != 0 ||
-            (Win32Native.GetAsyncKeyState(Win32Native.VK_LWIN) & 0x8000) != 0 ||
-            (Win32Native.GetAsyncKeyState(Win32Native.VK_RWIN) & 0x8000) != 0)
+        switch ((int)vk)
+        {
+            case Win32Native.VK_LCONTROL: _lCtrlDown = down; break;
+            case Win32Native.VK_RCONTROL: _rCtrlDown = down; break;
+            case Win32Native.VK_LMENU: _lAltDown = down; break;
+            case Win32Native.VK_RMENU: _rAltDown = down; break;
+            case Win32Native.VK_LSHIFT: _lShiftDown = down; break;
+            case Win32Native.VK_RSHIFT: _rShiftDown = down; break;
+            case Win32Native.VK_LWIN: _lWinDown = down; break;
+            case Win32Native.VK_RWIN: _rWinDown = down; break;
+        }
+    }
+
+    private bool IsCtrlAltWinHeld()
+    {
+        var ctrl = _lCtrlDown || _rCtrlDown || (Win32Native.GetAsyncKeyState(Win32Native.VK_CONTROL) & 0x8000) != 0;
+        var alt = _lAltDown || _rAltDown || (Win32Native.GetAsyncKeyState(Win32Native.VK_MENU) & 0x8000) != 0;
+        var win = _lWinDown || _rWinDown ||
+                  (Win32Native.GetAsyncKeyState(Win32Native.VK_LWIN) & 0x8000) != 0 ||
+                  (Win32Native.GetAsyncKeyState(Win32Native.VK_RWIN) & 0x8000) != 0;
+        return ctrl && alt && win;
+    }
+
+    private char ResolveUnicodeChar(uint vk, uint scan)
+    {
+        // Never convert modifier keys themselves or Ctrl/Alt/Win shortcuts (e.g. Ctrl+C, Ctrl+V, Alt+Tab) to Unicode!
+        // Note: On Brazilian ABNT2 keyboards, AltGr sends LCtrl + RAlt together.
+        var isAltGr = _rAltDown;
+        var isShortcut = (_lCtrlDown && !isAltGr) || _rCtrlDown || _lAltDown || _lWinDown || _rWinDown;
+        if (isShortcut)
             return '\0';
 
+        if (vk is Win32Native.VK_LCONTROL or Win32Native.VK_RCONTROL or Win32Native.VK_LMENU or Win32Native.VK_RMENU
+            or Win32Native.VK_LSHIFT or Win32Native.VK_RSHIFT or Win32Native.VK_LWIN or Win32Native.VK_RWIN)
+            return '\0';
+
+        // Build explicit key state array using our tracked modifiers (since WH_KEYBOARD_LL swallows Shift/AltGr!)
         var state = new byte[256];
-        if (!Win32Native.GetKeyboardState(state)) return '\0';
+        if (_lShiftDown || _rShiftDown) state[Win32Native.VK_SHIFT] = 0x80;
+        if (_lShiftDown) state[Win32Native.VK_LSHIFT] = 0x80;
+        if (_rShiftDown) state[Win32Native.VK_RSHIFT] = 0x80;
+        if (isAltGr)
+        {
+            state[Win32Native.VK_CONTROL] = 0x80;
+            state[Win32Native.VK_LCONTROL] = 0x80;
+            state[Win32Native.VK_MENU] = 0x80;
+            state[Win32Native.VK_RMENU] = 0x80;
+        }
+        if ((Win32Native.GetKeyState(Win32Native.VK_CAPITAL) & 0x01) != 0)
+            state[Win32Native.VK_CAPITAL] = 0x01;
+
         var fg = Win32Native.GetForegroundWindow();
         var tid = fg != nint.Zero ? Win32Native.GetWindowThreadProcessId(fg, out _) : 0;
         var layout = Win32Native.GetKeyboardLayout(tid);
 
         var sb = new System.Text.StringBuilder(8);
-        // Flag 4 (Windows 10 1607+): do not alter dead-key state in kernel buffer
         var rc = Win32Native.ToUnicodeEx(vk, scan, state, sb, sb.Capacity, 4, layout);
         return rc == 1 && sb.Length == 1 && !char.IsControl(sb[0]) ? sb[0] : '\0';
     }
@@ -560,41 +604,55 @@ public sealed class MasterInputCapture : IDisposable
         _ready.Dispose();
     }
 
-    private sealed class CursorBlankWindow : Form
+    private sealed class RawMouseMessageWindow : NativeWindow, IDisposable
     {
-        [DllImport("user32.dll")]
-        private static extern nint SetCursor(nint hCursor);
+        private readonly Action<int, int> _onDelta;
 
-        public CursorBlankWindow()
+        public RawMouseMessageWindow(Action<int, int> onDelta)
         {
-            FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
-            TopMost = true;
-            StartPosition = FormStartPosition.Manual;
-            Size = new System.Drawing.Size(120, 120);
-            Opacity = 0.01;
-            BackColor = System.Drawing.Color.Black;
-        }
-
-        protected override CreateParams CreateParams
-        {
-            get
+            _onDelta = onDelta;
+            CreateHandle(new CreateParams
             {
-                var cp = base.CreateParams;
-                cp.ExStyle |= 0x00000080 | 0x08000000; // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-                return cp;
-            }
+                Caption = "MultiSyncRawMouseSink",
+                Parent = new nint(-3), // HWND_MESSAGE
+            });
+
+            var devices = new[]
+            {
+                new Win32Native.RAWINPUTDEVICE
+                {
+                    UsagePage = 0x01, // Generic Desktop Controls
+                    Usage = 0x02,     // Mouse
+                    Flags = Win32Native.RIDEV_INPUTSINK,
+                    Target = Handle,
+                },
+            };
+            Win32Native.RegisterRawInputDevices(devices, 1, (uint)Marshal.SizeOf<Win32Native.RAWINPUTDEVICE>());
         }
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == 0x0020) // WM_SETCURSOR
+            if (m.Msg == Win32Native.WM_INPUT)
             {
-                SetCursor(nint.Zero);
-                m.Result = 1;
-                return;
+                var size = (uint)Marshal.SizeOf<Win32Native.RAWINPUT_MOUSE>();
+                var hdrSize = (uint)Marshal.SizeOf<Win32Native.RAWINPUTHEADER>();
+                if (Win32Native.GetRawInputData(m.LParam, Win32Native.RID_INPUT, out var raw, ref size, hdrSize) != uint.MaxValue)
+                {
+                    if (raw.Header.Type == Win32Native.RIM_TYPEMOUSE &&
+                        (raw.Mouse.Flags & Win32Native.MOUSE_MOVE_ABSOLUTE) == 0 &&
+                        (raw.Mouse.LastX != 0 || raw.Mouse.LastY != 0))
+                    {
+                        _onDelta(raw.Mouse.LastX, raw.Mouse.LastY);
+                    }
+                }
             }
             base.WndProc(ref m);
+        }
+
+        public void Dispose()
+        {
+            if (Handle != nint.Zero)
+                DestroyHandle();
         }
     }
 }

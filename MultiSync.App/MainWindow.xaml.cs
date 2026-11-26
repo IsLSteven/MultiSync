@@ -40,6 +40,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _coordinator = coordinator;
         _coordinator.StateUpdated += () => Dispatcher.BeginInvoke(RefreshStatusAndLan);
+        _coordinator.Engine.TransferActivity += msg => Dispatcher.BeginInvoke(() => SetStatus(msg));
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2.5) };
         _timer.Tick += (_, _) => RefreshStatusAndLan();

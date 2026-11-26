@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using MultiSync.Core.ClipboardSync;
 using MultiSync.Core.Models;
 using MultiSync.Core.Topology;
 using MultiSync.Core.Win32;
@@ -23,20 +24,31 @@ public enum KvmPacketType : byte
     MouseWheel = 12,
     KeyEvent = 13,
     ClipboardText = 14,
+    ClipboardImage = 15,
+    FileTransferStart = 16,
+    FileTransferChunk = 17,
+    FileTransferComplete = 18,
     Ping = 20,
     Pong = 21,
 }
 
 public sealed class KvmSessionEngine : IDisposable
 {
+    private const int FileChunkBytes = 32 * 1024; // 32 KB chunks keep mouse input ultra-responsive during transfers
+
     private readonly Lock _lifecycleLock = new();
     private CancellationTokenSource? _runCts;
+    private CancellationTokenSource? _fileSendCts;
     private Task? _runTask;
     private MasterInputCapture? _capture;
+    private ClipboardSyncManager? _clipboard;
     private X509Certificate2? _tlsCert;
 
     private MultiSyncConfig _config;
     private readonly ConcurrentDictionary<string, ConnectedSlaveSession> _slaves = new(StringComparer.OrdinalIgnoreCase);
+
+    // Slave-side active stream writer (for sending clipboard/files from Slave -> Master)
+    private Func<KvmPacketType, byte[], Task>? _slaveOutboundSender;
 
     private volatile bool _lockedToCurrentScreen;
     private string? _activeRemoteDevice;
@@ -44,9 +56,9 @@ public sealed class KvmSessionEngine : IDisposable
     private double _remoteCursorY;
     private int _remoteWidth = 1920;
     private int _remoteHeight = 1080;
-    private string _lastSyncedClipboard = "";
 
     public event Action? StatusChanged;
+    public event Action<string>? TransferActivity;
 
     public KvmSessionEngine(MultiSyncConfig initialConfig)
     {
@@ -66,6 +78,14 @@ public sealed class KvmSessionEngine : IDisposable
         lock (_lifecycleLock)
         {
             StopInternal();
+            ClipboardSyncManager.CleanupOldStagingFolders();
+
+            _clipboard = new ClipboardSyncManager();
+            _clipboard.LocalTextCopied += OnLocalTextCopied;
+            _clipboard.LocalImageCopied += OnLocalImageCopied;
+            _clipboard.LocalFilesCopied += OnLocalFilesCopied;
+            _clipboard.Start();
+
             _runCts = new CancellationTokenSource();
             var token = _runCts.Token;
             _runTask = _config.Role == DeviceRole.Master
@@ -89,6 +109,161 @@ public sealed class KvmSessionEngine : IDisposable
         _lockedToCurrentScreen = !_lockedToCurrentScreen;
         StatusChanged?.Invoke();
     }
+
+    // ==================== BIDIRECTIONAL CLIPBOARD & FILE TRANSFER ====================
+
+    private void OnLocalTextCopied(string text)
+    {
+        var bytes = Encoding.UTF8.GetBytes(text);
+        _ = BroadcastToPeersAsync(KvmPacketType.ClipboardText, bytes);
+    }
+
+    private void OnLocalImageCopied(byte[] pngBytes)
+    {
+        _ = BroadcastToPeersAsync(KvmPacketType.ClipboardImage, pngBytes);
+    }
+
+    private void OnLocalFilesCopied(List<string> paths)
+    {
+        if (_config.Role == DeviceRole.Master && _slaves.IsEmpty) return;
+        if (_config.Role == DeviceRole.Slave && _slaveOutboundSender == null) return;
+
+        var built = ClipboardSyncManager.BuildFileManifest(paths);
+        if (built == null)
+        {
+            TransferActivity?.Invoke("Arquivos copiados excedem 512 MB (limite da transferência automática).");
+            return;
+        }
+
+        _fileSendCts?.Cancel();
+        _fileSendCts?.Dispose();
+        _fileSendCts = CancellationTokenSource.CreateLinkedTokenSource(_runCts?.Token ?? CancellationToken.None);
+        var cancel = _fileSendCts.Token;
+
+        _ = Task.Run(() => StreamFilesToPeersAsync(built.Value.Manifest, built.Value.FullPathByRelative, cancel), cancel);
+    }
+
+    private async Task BroadcastToPeersAsync(KvmPacketType type, byte[] payload)
+    {
+        if (_config.Role == DeviceRole.Master)
+        {
+            foreach (var slave in _slaves.Values)
+                await slave.SendAsync(type, payload);
+        }
+        else if (_slaveOutboundSender is { } send)
+        {
+            await send(type, payload);
+        }
+    }
+
+    private async Task StreamFilesToPeersAsync(
+        FileTransferManifest manifest,
+        Dictionary<string, string> fullPaths,
+        CancellationToken cancel)
+    {
+        try
+        {
+            TransferActivity?.Invoke($"Enviando {manifest.Entries.Count(e => !e.IsDirectory)} arquivo(s) ({FormatSize(manifest.TotalBytes)})...");
+
+            var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(manifest, ConfigStore.JsonOptions);
+            await BroadcastToPeersAsync(KvmPacketType.FileTransferStart, manifestBytes);
+
+            long sentBytes = 0;
+            int lastPct = -1;
+            var readBuf = new byte[FileChunkBytes];
+
+            for (var i = 0; i < manifest.Entries.Count; i++)
+            {
+                cancel.ThrowIfCancellationRequested();
+                var entry = manifest.Entries[i];
+                if (entry.IsDirectory) continue;
+                if (!fullPaths.TryGetValue(entry.RelativePath, out var diskPath) || !File.Exists(diskPath))
+                    continue;
+
+                await using var fs = new FileStream(diskPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileChunkBytes, useAsync: true);
+                int read;
+                while ((read = await fs.ReadAsync(readBuf, cancel)) > 0)
+                {
+                    var packet = new byte[4 + read];
+                    BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(0, 4), i);
+                    Buffer.BlockCopy(readBuf, 0, packet, 4, read);
+                    await BroadcastToPeersAsync(KvmPacketType.FileTransferChunk, packet);
+
+                    sentBytes += read;
+                    var pct = manifest.TotalBytes > 0 ? (int)(sentBytes * 100 / manifest.TotalBytes) : 100;
+                    if (pct != lastPct && (pct % 10 == 0 || pct == 100))
+                    {
+                        lastPct = pct;
+                        TransferActivity?.Invoke($"Enviando arquivos: {pct}% ({FormatSize(sentBytes)} / {FormatSize(manifest.TotalBytes)})");
+                    }
+
+                    // Yield briefly so interactive mouse/keyboard packets stay silky-smooth
+                    await Task.Yield();
+                }
+            }
+
+            await BroadcastToPeersAsync(KvmPacketType.FileTransferComplete, Encoding.UTF8.GetBytes(manifest.TransferId));
+            TransferActivity?.Invoke("Arquivos enviados! Pode apertar Ctrl+V no outro computador.");
+        }
+        catch (OperationCanceledException)
+        {
+            // replaced by a newer copy
+        }
+        catch (Exception ex)
+        {
+            TransferActivity?.Invoke($"Erro ao transferir arquivos: {ex.Message}");
+        }
+    }
+
+    private void HandleIncomingClipboardOrFilePacket(
+        KvmPacketType pktType,
+        byte[] data,
+        ref IncomingFileReceiver? fileReceiver)
+    {
+        switch (pktType)
+        {
+            case KvmPacketType.ClipboardText:
+                _clipboard?.ApplyRemoteText(Encoding.UTF8.GetString(data));
+                break;
+
+            case KvmPacketType.ClipboardImage:
+                _clipboard?.ApplyRemoteImagePng(data);
+                break;
+
+            case KvmPacketType.FileTransferStart:
+                fileReceiver?.Dispose();
+                fileReceiver = null;
+                try
+                {
+                    var manifest = JsonSerializer.Deserialize<FileTransferManifest>(data, ConfigStore.JsonOptions);
+                    if (manifest != null)
+                    {
+                        fileReceiver = new IncomingFileReceiver(manifest, msg => TransferActivity?.Invoke(msg));
+                        TransferActivity?.Invoke($"Recebendo {manifest.Entries.Count(e => !e.IsDirectory)} arquivo(s) ({FormatSize(manifest.TotalBytes)})...");
+                    }
+                }
+                catch { }
+                break;
+
+            case KvmPacketType.FileTransferChunk when fileReceiver != null && data.Length >= 4:
+                var entryIdx = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(0, 4));
+                fileReceiver.WriteChunk(entryIdx, data.AsSpan(4));
+                break;
+
+            case KvmPacketType.FileTransferComplete when fileReceiver != null:
+                var topPaths = fileReceiver.CompleteAndGetTopLevelPaths();
+                fileReceiver.Dispose();
+                fileReceiver = null;
+                if (topPaths.Count > 0)
+                {
+                    _clipboard?.ApplyRemoteFiles(topPaths);
+                    TransferActivity?.Invoke($"Arquivos recebidos ({topPaths.Count} item(ns))! Aperte Ctrl+V para colar.");
+                }
+                break;
+        }
+    }
+
+    // ==================== MASTER / SLAVE TLS TRANSPORT ====================
 
     private async Task RunMasterAsync(CancellationToken cancel)
     {
@@ -131,14 +306,8 @@ public sealed class KvmSessionEngine : IDisposable
                 _ = HandleIncomingSlaveAsync(tcp, cancel);
             }
         }
-        catch (OperationCanceledException) when (cancel.IsCancellationRequested)
-        {
-            // normal shutdown
-        }
-        catch
-        {
-            // port bind failure
-        }
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested) { }
+        catch { }
         finally
         {
             listener?.Stop();
@@ -154,6 +323,7 @@ public sealed class KvmSessionEngine : IDisposable
     private async Task HandleIncomingSlaveAsync(TcpClient tcp, CancellationToken cancel)
     {
         string? peerName = null;
+        IncomingFileReceiver? fileReceiver = null;
         try
         {
             var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
@@ -194,19 +364,16 @@ public sealed class KvmSessionEngine : IDisposable
                     LatestPingMs = Math.Round(elapsedMs, 1);
                     StatusChanged?.Invoke();
                 }
-                else if (pktType == KvmPacketType.ClipboardText)
+                else
                 {
-                    var txt = Encoding.UTF8.GetString(pktData);
-                    SetLocalClipboardText(txt);
+                    HandleIncomingClipboardOrFilePacket(pktType, pktData, ref fileReceiver);
                 }
             }
         }
-        catch
-        {
-            // disconnected
-        }
+        catch { }
         finally
         {
+            fileReceiver?.Dispose();
             if (peerName != null && _slaves.TryRemove(peerName, out var removed))
             {
                 removed.Dispose();
@@ -234,6 +401,8 @@ public sealed class KvmSessionEngine : IDisposable
 
             TcpClient? tcp = null;
             SslStream? ssl = null;
+            IncomingFileReceiver? fileReceiver = null;
+            SemaphoreSlim? writeLock = null;
             try
             {
                 tcp = new TcpClient { NoDelay = true };
@@ -257,6 +426,17 @@ public sealed class KvmSessionEngine : IDisposable
 
                 var (okType, _) = await ReadPacketAsync(ssl, cancel);
                 if (okType != KvmPacketType.AuthOk) continue;
+
+                writeLock = new SemaphoreSlim(1, 1);
+                var activeSsl = ssl;
+                var activeLock = writeLock;
+                _slaveOutboundSender = async (t, p) =>
+                {
+                    await activeLock.WaitAsync(cancel);
+                    try { await WritePacketAsync(activeSsl, t, p, cancel); }
+                    catch { }
+                    finally { activeLock.Release(); }
+                };
 
                 SlaveConnectedToMaster = true;
                 StatusChanged?.Invoke();
@@ -291,12 +471,12 @@ public sealed class KvmSessionEngine : IDisposable
                                 (char)BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(6, 2)));
                             break;
 
-                        case KvmPacketType.ClipboardText:
-                            SetLocalClipboardText(Encoding.UTF8.GetString(data));
+                        case KvmPacketType.Ping:
+                            await _slaveOutboundSender(KvmPacketType.Pong, data);
                             break;
 
-                        case KvmPacketType.Ping:
-                            await WritePacketAsync(ssl, KvmPacketType.Pong, data, cancel);
+                        default:
+                            HandleIncomingClipboardOrFilePacket(pktType, data, ref fileReceiver);
                             break;
                     }
                 }
@@ -305,14 +485,14 @@ public sealed class KvmSessionEngine : IDisposable
             {
                 break;
             }
-            catch
-            {
-                // retry reconnect
-            }
+            catch { }
             finally
             {
+                _slaveOutboundSender = null;
                 SlaveConnectedToMaster = false;
                 StatusChanged?.Invoke();
+                fileReceiver?.Dispose();
+                writeLock?.Dispose();
                 ssl?.Dispose();
                 tcp?.Dispose();
             }
@@ -332,9 +512,12 @@ public sealed class KvmSessionEngine : IDisposable
         var bounds = Screen.PrimaryScreen?.Bounds ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
         var corner = _config.DeadCornerPixels;
 
-        var inCorner = (x < bounds.Left + corner || x >= bounds.Right - corner) &&
-                       (y < bounds.Top + corner || y >= bounds.Bottom - corner);
-        if (inCorner) return;
+        if (corner > 0)
+        {
+            var inCorner = (x < bounds.Left + corner || x >= bounds.Right - corner) &&
+                           (y < bounds.Top + corner || y >= bounds.Bottom - corner);
+            if (inCorner) return;
+        }
 
         ScreenSide? crossed = null;
         if (x >= bounds.Right - 1) crossed = ScreenSide.Right;
@@ -374,11 +557,21 @@ public sealed class KvmSessionEngine : IDisposable
         _remoteCursorX = entryX;
         _remoteCursorY = entryY;
 
-        PushLocalClipboardIfChanged(slave);
+        // Keep Master's cursor parked right on the exact edge pixel where the user crossed!
+        var edgeX = exitSide switch
+        {
+            ScreenSide.Right => localBounds.Right - 1,
+            ScreenSide.Left => localBounds.Left,
+            _ => Math.Clamp(localX, localBounds.Left, localBounds.Right - 1),
+        };
+        var edgeY = exitSide switch
+        {
+            ScreenSide.Down => localBounds.Bottom - 1,
+            ScreenSide.Up => localBounds.Top,
+            _ => Math.Clamp(localY, localBounds.Top, localBounds.Bottom - 1),
+        };
 
-        var parkX = localBounds.Left + localBounds.Width / 2;
-        var parkY = localBounds.Top + localBounds.Height / 2;
-        _capture?.EnterRemoteCapture(parkX, parkY);
+        _capture?.EnterRemoteCapture(edgeX, edgeY);
         SendMouseMoveToSlave(slave, entryX, entryY);
         StatusChanged?.Invoke();
     }
@@ -433,15 +626,15 @@ public sealed class KvmSessionEngine : IDisposable
     {
         _activeRemoteDevice = null;
         var bounds = Screen.PrimaryScreen?.Bounds ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
-        var ratioX = Math.Clamp(_remoteCursorX / Math.Max(1, _remoteWidth), 0, 1);
-        var ratioY = Math.Clamp(_remoteCursorY / Math.Max(1, _remoteHeight), 0, 1);
+        var ratioX = Math.Clamp(_remoteCursorX / Math.Max(1, _remoteWidth - 1), 0, 1);
+        var ratioY = Math.Clamp(_remoteCursorY / Math.Max(1, _remoteHeight - 1), 0, 1);
 
         var (lx, ly) = fromRemoteSide switch
         {
-            ScreenSide.Left => (bounds.Right - 4, bounds.Top + (int)(ratioY * (bounds.Height - 1))),
-            ScreenSide.Right => (bounds.Left + 4, bounds.Top + (int)(ratioY * (bounds.Height - 1))),
-            ScreenSide.Up => (bounds.Left + (int)(ratioX * (bounds.Width - 1)), bounds.Bottom - 4),
-            ScreenSide.Down => (bounds.Left + (int)(ratioX * (bounds.Width - 1)), bounds.Top + 4),
+            ScreenSide.Left => (bounds.Right - 4, bounds.Top + (int)Math.Round(ratioY * (bounds.Height - 1))),
+            ScreenSide.Right => (bounds.Left + 4, bounds.Top + (int)Math.Round(ratioY * (bounds.Height - 1))),
+            ScreenSide.Up => (bounds.Left + (int)Math.Round(ratioX * (bounds.Width - 1)), bounds.Bottom - 4),
+            ScreenSide.Down => (bounds.Left + (int)Math.Round(ratioX * (bounds.Width - 1)), bounds.Top + 4),
             _ => (bounds.Left + bounds.Width / 2, bounds.Top + bounds.Height / 2),
         };
 
@@ -507,41 +700,11 @@ public sealed class KvmSessionEngine : IDisposable
         _ = slave.SendAsync(KvmPacketType.MouseMove, buf);
     }
 
-    private void PushLocalClipboardIfChanged(ConnectedSlaveSession slave)
+    private static string FormatSize(long bytes)
     {
-        var txt = TryGetLocalClipboardText();
-        if (!string.IsNullOrEmpty(txt) && txt != _lastSyncedClipboard && txt.Length <= 512_000)
-        {
-            _lastSyncedClipboard = txt;
-            _ = slave.SendAsync(KvmPacketType.ClipboardText, Encoding.UTF8.GetBytes(txt));
-        }
-    }
-
-    private static string? TryGetLocalClipboardText()
-    {
-        string? text = null;
-        var t = new Thread(() =>
-        {
-            try { if (Clipboard.ContainsText()) text = Clipboard.GetText(); }
-            catch { /* clipboard busy */ }
-        });
-        t.SetApartmentState(ApartmentState.STA);
-        t.Start();
-        t.Join(150);
-        return text;
-    }
-
-    private void SetLocalClipboardText(string text)
-    {
-        if (string.IsNullOrEmpty(text) || text == _lastSyncedClipboard) return;
-        _lastSyncedClipboard = text;
-        var t = new Thread(() =>
-        {
-            try { Clipboard.SetText(text); }
-            catch { /* clipboard busy */ }
-        });
-        t.SetApartmentState(ApartmentState.STA);
-        t.Start();
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:0.0} KB";
+        return $"{bytes / (1024.0 * 1024.0):0.0} MB";
     }
 
     private static long StopwatchTicks() => System.Diagnostics.Stopwatch.GetTimestamp();
@@ -570,7 +733,7 @@ public sealed class KvmSessionEngine : IDisposable
         var hdr = new byte[5];
         await stream.ReadExactlyAsync(hdr, cancel);
         var len = BinaryPrimitives.ReadInt32BigEndian(hdr.AsSpan(1, 4));
-        if (len < 0 || len > 4 * 1024 * 1024)
+        if (len < 0 || len > 24 * 1024 * 1024)
             throw new InvalidDataException("KVM frame size out of bounds.");
         var buf = len == 0 ? [] : new byte[len];
         if (len > 0)
@@ -580,17 +743,115 @@ public sealed class KvmSessionEngine : IDisposable
 
     private void StopInternal()
     {
+        _fileSendCts?.Cancel();
+        _fileSendCts?.Dispose();
+        _fileSendCts = null;
+
         _runCts?.Cancel();
-        try { _runTask?.Wait(TimeSpan.FromSeconds(1)); } catch { /* ignore */ }
+        try { _runTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
         _runCts?.Dispose();
         _runCts = null;
         _runTask = null;
+
+        _clipboard?.Dispose();
+        _clipboard = null;
     }
 
     public void Dispose()
     {
         lock (_lifecycleLock) StopInternal();
         _tlsCert?.Dispose();
+    }
+
+    private sealed class IncomingFileReceiver : IDisposable
+    {
+        private readonly FileTransferManifest _manifest;
+        private readonly string _stagingDir;
+        private readonly Action<string> _onProgress;
+        private int _openEntryIndex = -1;
+        private FileStream? _openStream;
+        private long _receivedBytes;
+        private int _lastPct = -1;
+
+        public IncomingFileReceiver(FileTransferManifest manifest, Action<string> onProgress)
+        {
+            _manifest = manifest;
+            _onProgress = onProgress;
+            _stagingDir = Path.Combine(ClipboardSyncManager.GetStagingRoot(), manifest.TransferId);
+            Directory.CreateDirectory(_stagingDir);
+
+            foreach (var entry in manifest.Entries)
+            {
+                var safePath = SafeCombine(_stagingDir, entry.RelativePath);
+                if (safePath == null) continue;
+                if (entry.IsDirectory)
+                    Directory.CreateDirectory(safePath);
+                else
+                {
+                    var parent = Path.GetDirectoryName(safePath);
+                    if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+                    // Create empty file immediately so 0-byte files are preserved too
+                    using (File.Create(safePath)) { }
+                }
+            }
+        }
+
+        public void WriteChunk(int entryIndex, ReadOnlySpan<byte> chunk)
+        {
+            if (entryIndex < 0 || entryIndex >= _manifest.Entries.Count) return;
+            var entry = _manifest.Entries[entryIndex];
+            if (entry.IsDirectory) return;
+
+            if (_openEntryIndex != entryIndex)
+            {
+                _openStream?.Dispose();
+                _openStream = null;
+                _openEntryIndex = entryIndex;
+
+                var safePath = SafeCombine(_stagingDir, entry.RelativePath);
+                if (safePath == null) return;
+                var parent = Path.GetDirectoryName(safePath);
+                if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+                _openStream = new FileStream(safePath, FileMode.Create, FileAccess.Write, FileShare.None, 32768);
+            }
+
+            _openStream?.Write(chunk);
+            _receivedBytes += chunk.Length;
+
+            var pct = _manifest.TotalBytes > 0 ? (int)(_receivedBytes * 100 / _manifest.TotalBytes) : 100;
+            if (pct != _lastPct && (pct % 10 == 0 || pct == 100))
+            {
+                _lastPct = pct;
+                _onProgress($"Recebendo arquivos: {pct}% ({FormatSize(_receivedBytes)} / {FormatSize(_manifest.TotalBytes)})");
+            }
+        }
+
+        public List<string> CompleteAndGetTopLevelPaths()
+        {
+            _openStream?.Dispose();
+            _openStream = null;
+
+            var top = new List<string>();
+            if (Directory.Exists(_stagingDir))
+            {
+                top.AddRange(Directory.GetDirectories(_stagingDir));
+                top.AddRange(Directory.GetFiles(_stagingDir));
+            }
+            return top;
+        }
+
+        private static string? SafeCombine(string root, string relative)
+        {
+            var fullRoot = Path.GetFullPath(root);
+            var combined = Path.GetFullPath(Path.Combine(fullRoot, relative));
+            return combined.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase) ? combined : null;
+        }
+
+        public void Dispose()
+        {
+            _openStream?.Dispose();
+            _openStream = null;
+        }
     }
 
     private sealed class ConnectedSlaveSession(string name, int width, int height, TcpClient tcp, SslStream ssl) : IDisposable
@@ -608,10 +869,7 @@ public sealed class KvmSessionEngine : IDisposable
             {
                 await WritePacketAsync(ssl, type, payload, CancellationToken.None);
             }
-            catch
-            {
-                // reader loop handles disconnect cleanup
-            }
+            catch { }
             finally
             {
                 _writeLock.Release();
