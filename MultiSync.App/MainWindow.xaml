@@ -299,8 +299,12 @@
                 <TextBlock x:Name="FeedbackStatusText" Grid.Column="0"
                            Text="Pronto. Atalhos globais: Ctrl+Alt+Win+L (travar tela)  •  Ctrl+Alt+Win+Setas (mudar de tela)."
                            FontSize="12" Foreground="#9CA3AF" VerticalAlignment="Center"/>
-                <TextBlock x:Name="LatencyText" Grid.Column="1" Text="" FontSize="12" FontWeight="SemiBold"
-                           Foreground="#10B981" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="LatencyText" Text="" FontSize="12" FontWeight="SemiBold"
+                               Foreground="#10B981" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="VersionText" Text="v0.4.0" FontSize="11"
+                               Foreground="#6B7280" VerticalAlignment="Center" Margin="12,0,0,0"/>
+                </StackPanel>
             </Grid>
         </Border>
     </Grid>

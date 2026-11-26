@@ -40,6 +40,9 @@ public partial class MainWindow : Window
     public MainWindow(AppCoordinator coordinator)
     {
         InitializeComponent();
+        var ver = typeof(MainWindow).Assembly.GetName().Version;
+        if (ver != null)
+            VersionText.Text = $"v{ver.Major}.{ver.Minor}.{ver.Build}";
         _coordinator = coordinator;
         _coordinator.StateUpdated += () => Dispatcher.BeginInvoke(RefreshStatusAndLan);
         _coordinator.Engine.TransferActivity += msg => Dispatcher.BeginInvoke(() => SetStatus(msg));
