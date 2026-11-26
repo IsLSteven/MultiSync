@@ -1,3 +1,4 @@
+using System.Collections.Specialized;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
@@ -17,13 +18,13 @@ public sealed record FileTransferEntry(
     bool IsDirectory);
 
 /// <summary>
-/// Pure Win32 bidirectional clipboard monitor and writer using GetClipboardSequenceNumber() +
-/// OpenClipboard(HWND_MESSAGE) + GetClipboardData/SetClipboardData.
-/// Supports UTF-16 text (CF_UNICODETEXT), images (PNG + CF_DIB), and files/folders (CF_HDROP + Preferred DropEffect).
+/// Bidirectional Windows clipboard monitor and writer.
+/// Uses GetClipboardSequenceNumber() + Win32 OpenClipboard for fast polling, and STA OLE Clipboard
+/// (Clipboard.SetDataObject with FileDrop + Preferred DropEffect) so Windows Explorer Ctrl+V works reliably.
 /// </summary>
 public sealed class ClipboardSyncManager : IDisposable
 {
-    public const long MaxAutoFileTransferBytes = 512L * 1024 * 1024; // 512 MB
+    public const long MaxAutoFileTransferBytes = 2L * 1024 * 1024 * 1024; // 2 GB
     public const int MaxImageBytes = 20 * 1024 * 1024; // 20 MB
     public const int MaxTextChars = 2 * 1024 * 1024;
 
@@ -41,7 +42,7 @@ public sealed class ClipboardSyncManager : IDisposable
 
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
-    private OwnerMessageWindow? _ownerWindow;
+    private StaClipboardHost? _staHost;
     private Thread? _ownerThread;
     private readonly ManualResetEventSlim _ownerReady = new();
 
@@ -58,15 +59,16 @@ public sealed class ClipboardSyncManager : IDisposable
         if (_cts != null) return;
         _cts = new CancellationTokenSource();
 
-        // Create a dedicated HWND_MESSAGE window so OpenClipboard(ownerHwnd) always has a valid owner per MSDN
+        // Dedicated STA thread with message pump for Win32 OpenClipboard owner + OLE Clipboard (SetFileDropList)
         _ownerThread = new Thread(() =>
         {
-            _ownerWindow = new OwnerMessageWindow();
+            _staHost = new StaClipboardHost();
+            _ = _staHost.Handle; // force HWND creation on STA thread
             _ownerReady.Set();
             Application.Run();
         })
         {
-            Name = "MultiSync.ClipboardOwner",
+            Name = "MultiSync.ClipboardSTA",
             IsBackground = true,
         };
         _ownerThread.SetApartmentState(ApartmentState.STA);
@@ -113,13 +115,20 @@ public sealed class ClipboardSyncManager : IDisposable
 
     public bool ApplyRemoteFiles(IReadOnlyList<string> localPaths)
     {
-        var valid = localPaths.Where(p => !string.IsNullOrWhiteSpace(p) && (File.Exists(p) || Directory.Exists(p))).ToList();
+        var valid = localPaths
+            .Where(p => !string.IsNullOrWhiteSpace(p) && (File.Exists(p) || Directory.Exists(p)))
+            .ToList();
         if (valid.Count == 0) return false;
 
         var hash = HashString("F:" + string.Join("|", valid));
+
+        // Prefer STA OLE Clipboard (OleSetClipboard + OleFlushClipboard) so Windows Explorer always enables Ctrl+V
+        if (TryWriteFilesViaStaOle(valid, hash))
+            return true;
+
+        // Fallback to pure Win32 CF_HDROP + Preferred DropEffect
         var dropBytes = BuildDropFilesBuffer(valid);
         var copyEffect = BitConverter.GetBytes(1u); // DROPEFFECT_COPY = 1
-
         return WriteClipboard(() =>
         {
             var okDrop = SetGlobalData(CF_HDROP, dropBytes);
@@ -127,6 +136,44 @@ public sealed class ClipboardSyncManager : IDisposable
                 SetGlobalData(CfPreferredDropEffect, copyEffect);
             return okDrop;
         }, hash);
+    }
+
+    private bool TryWriteFilesViaStaOle(List<string> paths, string contentHash)
+    {
+        var host = _staHost;
+        if (host == null || host.IsDisposed || !host.IsHandleCreated)
+            return false;
+
+        try
+        {
+            var ok = false;
+            host.Invoke(() =>
+            {
+                lock (ClipboardLock)
+                {
+                    var sc = new StringCollection();
+                    foreach (var p in paths) sc.Add(p);
+
+                    var dataObj = new DataObject();
+                    dataObj.SetFileDropList(sc);
+                    // Mark as DROPEFFECT_COPY (1) so Explorer copies instead of moving
+                    var effectStream = new MemoryStream(BitConverter.GetBytes(1));
+                    dataObj.SetData("Preferred DropEffect", effectStream);
+
+                    System.Windows.Forms.Clipboard.SetDataObject(dataObj, copy: true, retryTimes: 10, retryDelay: 25);
+                    _lastContentHash = contentHash;
+                    var seq = GetClipboardSequenceNumber();
+                    _lastWrittenSequence = seq;
+                    _lastObservedSequence = seq;
+                    ok = true;
+                }
+            });
+            return ok;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task PollLoopAsync(CancellationToken cancel)
@@ -197,9 +244,8 @@ public sealed class ClipboardSyncManager : IDisposable
             if (files.All(p => p.StartsWith(stagingRoot, StringComparison.OrdinalIgnoreCase)))
                 return;
 
-            var hash = HashString("F:" + string.Join("|", files));
-            if (hash == _lastContentHash) return;
-            _lastContentHash = hash;
+            // Always forward when user explicitly presses Ctrl+C on files (even if re-copying the same file)
+            _lastContentHash = HashString("F:" + string.Join("|", files));
             LocalFilesCopied?.Invoke(files);
             return;
         }
@@ -249,7 +295,7 @@ public sealed class ClipboardSyncManager : IDisposable
         }
     }
 
-    private nint OwnerHwnd => _ownerWindow?.Handle ?? nint.Zero;
+    private nint OwnerHwnd => _staHost is { IsDisposed: false, IsHandleCreated: true } ? _staHost.Handle : nint.Zero;
 
     private static bool TryOpenClipboard(nint owner)
     {
@@ -517,25 +563,30 @@ public sealed class ClipboardSyncManager : IDisposable
         _cts?.Cancel();
         try { _pollTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
         _cts?.Dispose();
-        _ownerWindow?.Dispose();
+        try
+        {
+            if (_staHost is { IsDisposed: false, IsHandleCreated: true })
+                _staHost.BeginInvoke(() => { _staHost.Dispose(); Application.ExitThread(); });
+        }
+        catch { }
         _ownerReady.Dispose();
     }
 
-    private sealed class OwnerMessageWindow : NativeWindow, IDisposable
+    private sealed class StaClipboardHost : Control
     {
-        public OwnerMessageWindow()
+        public StaClipboardHost()
         {
-            CreateHandle(new CreateParams
-            {
-                Caption = "MultiSyncClipboardOwner",
-                Parent = new nint(-3), // HWND_MESSAGE
-            });
+            Visible = false;
         }
 
-        public void Dispose()
+        protected override CreateParams CreateParams
         {
-            if (Handle != nint.Zero)
-                DestroyHandle();
+            get
+            {
+                var cp = base.CreateParams;
+                cp.Parent = new nint(-3); // HWND_MESSAGE
+                return cp;
+            }
         }
     }
 

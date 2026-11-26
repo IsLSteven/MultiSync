@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using MultiSync.Core.ClipboardSync;
 using MultiSync.Core.Models;
 
 namespace MultiSync.Core.Discovery;
@@ -55,13 +56,23 @@ public sealed record AudioControlMessage(
     int AudioPort,
     string SignatureHex);
 
+public sealed record FileTransferHeaderMessage(
+    string SenderName,
+    long UnixSeconds,
+    FileTransferManifest Manifest,
+    string SignatureHex);
+
 public sealed record ControlAckMessage(bool Success, string? Error = null);
 
 public sealed class LanDiscoveryAndControlService : IDisposable
 {
+    private const int FastFileBufferBytes = 256 * 1024; // 256 KB raw TCP streaming buffer
+
     private readonly ConfigStore _store;
     private readonly Action<MultiSyncConfig> _onRemoteConfigApplied;
     private readonly Action<string, string, int>? _onAudioControlRequested;
+    private readonly Action<List<string>>? _onFilesReceived;
+    private readonly Action<string>? _onFileTransferProgress;
     private readonly ConcurrentDictionary<string, LanDeviceBeacon> _discovered = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _instanceId = Guid.NewGuid().ToString("N")[..12];
     private readonly CancellationTokenSource _cts = new();
@@ -74,11 +85,15 @@ public sealed class LanDiscoveryAndControlService : IDisposable
     public LanDiscoveryAndControlService(
         ConfigStore store,
         Action<MultiSyncConfig> onRemoteConfigApplied,
-        Action<string, string, int>? onAudioControlRequested = null)
+        Action<string, string, int>? onAudioControlRequested = null,
+        Action<List<string>>? onFilesReceived = null,
+        Action<string>? onFileTransferProgress = null)
     {
         _store = store;
         _onRemoteConfigApplied = onRemoteConfigApplied;
         _onAudioControlRequested = onAudioControlRequested;
+        _onFilesReceived = onFilesReceived;
+        _onFileTransferProgress = onFileTransferProgress;
     }
 
     public void Start()
@@ -172,6 +187,95 @@ public sealed class LanDiscoveryAndControlService : IDisposable
         var ack = await SendControlRpcAsync<AudioControlMessage, ControlAckMessage>(targetIp, controlPort, "audio-control", msg, cancel);
         if (!ack.Success)
             throw new InvalidOperationException(ack.Error ?? $"Falha ao configurar áudio em {targetIp}.");
+    }
+
+    /// <summary>
+    /// Streams files/folders at full LAN speed (256 KB chunks) over a dedicated TCP connection on ControlPort,
+    /// completely independent of the interactive KVM mouse/keyboard stream.
+    /// </summary>
+    public static async Task SendFilesToPeerAsync(
+        string targetIp,
+        int controlPort,
+        string senderName,
+        string sessionKey,
+        FileTransferManifest manifest,
+        Dictionary<string, string> fullPaths,
+        Action<string>? onProgress = null,
+        CancellationToken cancel = default)
+    {
+        using var tcp = new TcpClient
+        {
+            NoDelay = true,
+            SendBufferSize = 512 * 1024,
+            ReceiveBufferSize = 64 * 1024,
+        };
+        using (var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancel))
+        {
+            connectTimeout.CancelAfter(TimeSpan.FromSeconds(6));
+            await tcp.ConnectAsync(targetIp, controlPort, connectTimeout.Token);
+        }
+
+        await using var stream = tcp.GetStream();
+        var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sig = ConfigStore.ComputeHmacHex(sessionKey, $"files|{senderName.ToLowerInvariant()}|{ts}|{manifest.TransferId}|{manifest.TotalBytes}");
+        var header = new FileTransferHeaderMessage(senderName, ts, manifest, sig);
+        var env = new RpcEnvelope("file-transfer", JsonSerializer.Serialize(header, ConfigStore.JsonOptions));
+        await WriteFrameAsync(stream, env, cancel);
+
+        var ack = await ReadFrameAsync<ControlAckMessage>(stream, cancel);
+        if (!ack.Success)
+            throw new InvalidOperationException(ack.Error ?? $"Peer {targetIp} recusou a transferência de arquivos.");
+
+        var buf = new byte[FastFileBufferBytes];
+        long sentBytes = 0;
+        var lastPct = -1;
+
+        foreach (var entry in manifest.Entries)
+        {
+            if (entry.IsDirectory) continue;
+            if (!fullPaths.TryGetValue(entry.RelativePath, out var diskPath))
+                throw new FileNotFoundException("Arquivo de origem não encontrado.", entry.RelativePath);
+
+            long remaining = entry.SizeBytes;
+            await using var fs = new FileStream(
+                diskPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                FastFileBufferBytes,
+                useAsync: true);
+
+            while (remaining > 0)
+            {
+                var toRead = (int)Math.Min(buf.Length, remaining);
+                var read = await fs.ReadAsync(buf.AsMemory(0, toRead), cancel);
+                if (read <= 0)
+                {
+                    // File shrank while reading: pad with zeros so framing stays intact
+                    Array.Clear(buf, 0, toRead);
+                    await stream.WriteAsync(buf.AsMemory(0, toRead), cancel);
+                    remaining -= toRead;
+                    sentBytes += toRead;
+                    continue;
+                }
+
+                await stream.WriteAsync(buf.AsMemory(0, read), cancel);
+                remaining -= read;
+                sentBytes += read;
+
+                var pct = manifest.TotalBytes > 0 ? (int)(sentBytes * 100 / manifest.TotalBytes) : 100;
+                if (pct != lastPct && (pct % 5 == 0 || pct == 100))
+                {
+                    lastPct = pct;
+                    onProgress?.Invoke($"Enviando arquivos: {pct}% ({FormatSize(sentBytes)} / {FormatSize(manifest.TotalBytes)})");
+                }
+            }
+        }
+
+        await stream.FlushAsync(cancel);
+        var finalAck = await ReadFrameAsync<ControlAckMessage>(stream, cancel);
+        if (!finalAck.Success)
+            throw new InvalidOperationException(finalAck.Error ?? "Erro ao concluir transferência no destino.");
     }
 
     private LanDeviceBeacon BuildLocalBeacon(string kind)
@@ -422,7 +526,93 @@ public sealed class LanDiscoveryAndControlService : IDisposable
                 await WriteFrameAsync(stream, new ControlAckMessage(true), timeout.Token);
                 _ = Task.Run(() => _onAudioControlRequested?.Invoke(req.Action, receiverIp, req.AudioPort));
             }
+            else if (env.Method == "file-transfer")
+            {
+                var req = JsonSerializer.Deserialize<FileTransferHeaderMessage>(env.BodyJson, ConfigStore.JsonOptions)!;
+                var localCfg = _store.GetSnapshot();
+
+                var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (Math.Abs(now - req.UnixSeconds) > 120)
+                {
+                    await WriteFrameAsync(stream, new ControlAckMessage(false, "Timestamp expirado."), timeout.Token);
+                    return;
+                }
+
+                var expectedSig = ConfigStore.ComputeHmacHex(
+                    localCfg.SessionKey,
+                    $"files|{req.SenderName.ToLowerInvariant()}|{req.UnixSeconds}|{req.Manifest.TransferId}|{req.Manifest.TotalBytes}");
+                if (!ConfigStore.FixedTimeEquals(expectedSig, req.SignatureHex))
+                {
+                    await WriteFrameAsync(stream, new ControlAckMessage(false, "Chave de sessão inválida para transferência de arquivos."), timeout.Token);
+                    return;
+                }
+
+                client.ReceiveBufferSize = 512 * 1024;
+                await WriteFrameAsync(stream, new ControlAckMessage(true), timeout.Token);
+
+                var stagingDir = Path.Combine(ClipboardSyncManager.GetStagingRoot(), req.Manifest.TransferId);
+                Directory.CreateDirectory(stagingDir);
+                var fullStagingRoot = Path.GetFullPath(stagingDir);
+
+                var fileCount = req.Manifest.Entries.Count(e => !e.IsDirectory);
+                _onFileTransferProgress?.Invoke($"Recebendo {fileCount} arquivo(s) ({FormatSize(req.Manifest.TotalBytes)})...");
+
+                var buf = new byte[FastFileBufferBytes];
+                long receivedBytes = 0;
+                var lastPct = -1;
+
+                foreach (var entry in req.Manifest.Entries)
+                {
+                    var safePath = Path.GetFullPath(Path.Combine(fullStagingRoot, entry.RelativePath));
+                    if (!safePath.StartsWith(fullStagingRoot, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("Caminho de arquivo inválido.");
+
+                    if (entry.IsDirectory)
+                    {
+                        Directory.CreateDirectory(safePath);
+                        continue;
+                    }
+
+                    var parent = Path.GetDirectoryName(safePath);
+                    if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+
+                    await using var fs = new FileStream(safePath, FileMode.Create, FileAccess.Write, FileShare.None, FastFileBufferBytes, useAsync: true);
+                    long remaining = entry.SizeBytes;
+                    while (remaining > 0)
+                    {
+                        var toRead = (int)Math.Min(buf.Length, remaining);
+                        var read = await stream.ReadAsync(buf.AsMemory(0, toRead), serverCancel);
+                        if (read <= 0)
+                            throw new EndOfStreamException("Conexão interrompida durante o recebimento do arquivo.");
+
+                        await fs.WriteAsync(buf.AsMemory(0, read), serverCancel);
+                        remaining -= read;
+                        receivedBytes += read;
+
+                        var pct = req.Manifest.TotalBytes > 0 ? (int)(receivedBytes * 100 / req.Manifest.TotalBytes) : 100;
+                        if (pct != lastPct && (pct % 5 == 0 || pct == 100))
+                        {
+                            lastPct = pct;
+                            _onFileTransferProgress?.Invoke($"Recebendo arquivos: {pct}% ({FormatSize(receivedBytes)} / {FormatSize(req.Manifest.TotalBytes)})");
+                        }
+                    }
+                }
+
+                var topPaths = new List<string>();
+                topPaths.AddRange(Directory.GetDirectories(stagingDir));
+                topPaths.AddRange(Directory.GetFiles(stagingDir));
+
+                _onFilesReceived?.Invoke(topPaths);
+                await WriteFrameAsync(stream, new ControlAckMessage(true), serverCancel);
+            }
         }
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:0.0} KB";
+        return $"{bytes / (1024.0 * 1024.0):0.0} MB";
     }
 
     private sealed record RpcEnvelope(string Method, string BodyJson);

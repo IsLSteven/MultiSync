@@ -67,7 +67,9 @@ public sealed class AppCoordinator : IDisposable
                     // ignore transient audio capture/device errors
                 }
                 StateUpdated?.Invoke();
-            });
+            },
+            onFilesReceived: topPaths => Engine.ApplyExternalReceivedFiles(topPaths),
+            onFileTransferProgress: msg => Engine.ReportTransferActivity(msg));
         Lan.DevicesUpdated += () => StateUpdated?.Invoke();
     }
 

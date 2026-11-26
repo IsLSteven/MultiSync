@@ -1,5 +1,6 @@
 using MultiSync.Core.Audio;
 using MultiSync.Core.ClipboardSync;
+using MultiSync.Core.Discovery;
 using MultiSync.Core.Models;
 using MultiSync.Core.Topology;
 using NAudio.Wave;
@@ -132,5 +133,54 @@ public class TopologyCompilerTests
         Assert.That(pcm16.Length, Is.InRange(3500, 4100));
         Assert.That(pcm16.Length % 4, Is.EqualTo(0));
         Assert.That(pcm16.Any(b => b != 0), Is.True);
+    }
+
+    [Test]
+    public async Task DedicatedLanFileTransfer_StreamsFilesByteForByte()
+    {
+        var tempSrc = Path.Combine(Path.GetTempPath(), "MultiSyncFastSrc_" + Guid.NewGuid().ToString("N")[..8]);
+        var tempCfg = Path.Combine(Path.GetTempPath(), "MultiSyncFastCfg_" + Guid.NewGuid().ToString("N")[..8] + ".json");
+        Directory.CreateDirectory(tempSrc);
+        var srcFile = Path.Combine(tempSrc, "payload.bin");
+        var expected = new byte[600 * 1024]; // 600 KB across multiple 256 KB chunks
+        Random.Shared.NextBytes(expected);
+        await File.WriteAllBytesAsync(srcFile, expected);
+
+        var receivedTcs = new TaskCompletionSource<List<string>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = new ConfigStore(tempCfg);
+        var cfg = store.GetSnapshot();
+        cfg.ControlPort = 51529;
+        cfg.DiscoveryPort = 51528;
+        cfg.SessionKey = "test-session-key-123";
+        store.Save(cfg);
+
+        using var lan = new LanDiscoveryAndControlService(
+            store,
+            onRemoteConfigApplied: _ => { },
+            onFilesReceived: paths => receivedTcs.TrySetResult(paths));
+        lan.Start();
+        await Task.Delay(150);
+
+        try
+        {
+            var built = ClipboardSyncManager.BuildFileManifest([srcFile])!;
+            await LanDiscoveryAndControlService.SendFilesToPeerAsync(
+                "127.0.0.1",
+                cfg.ControlPort,
+                "PC-Sender",
+                cfg.SessionKey,
+                built.Value.Manifest,
+                built.Value.FullPathByRelative);
+
+            var topPaths = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(topPaths.Count, Is.EqualTo(1));
+            var receivedBytes = await File.ReadAllBytesAsync(topPaths[0]);
+            Assert.That(receivedBytes, Is.EqualTo(expected));
+        }
+        finally
+        {
+            try { Directory.Delete(tempSrc, recursive: true); } catch { }
+            try { File.Delete(tempCfg); } catch { }
+        }
     }
 }

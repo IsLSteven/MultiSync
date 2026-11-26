@@ -8,6 +8,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using MultiSync.Core.ClipboardSync;
+using MultiSync.Core.Discovery;
 using MultiSync.Core.Models;
 using MultiSync.Core.Topology;
 using MultiSync.Core.Win32;
@@ -34,8 +35,6 @@ public enum KvmPacketType : byte
 
 public sealed class KvmSessionEngine : IDisposable
 {
-    private const int FileChunkBytes = 32 * 1024; // 32 KB chunks keep mouse input ultra-responsive during transfers
-
     private readonly Lock _lifecycleLock = new();
     private CancellationTokenSource? _runCts;
     private CancellationTokenSource? _fileSendCts;
@@ -125,15 +124,39 @@ public sealed class KvmSessionEngine : IDisposable
         TransferActivity?.Invoke($"Imagem copiada sincronizada ({FormatSize(pngBytes.Length)}).");
     }
 
+    public void ApplyExternalReceivedFiles(IReadOnlyList<string> topPaths)
+    {
+        if (topPaths.Count == 0) return;
+        if (_clipboard?.ApplyRemoteFiles(topPaths) == true)
+            TransferActivity?.Invoke($"✅ Arquivos recebidos ({topPaths.Count} item(ns))! Aperte Ctrl+V para colar.");
+        else
+            TransferActivity?.Invoke("Arquivos recebidos, mas não foi possível atualizar a área de transferência.");
+    }
+
+    public void ReportTransferActivity(string message) => TransferActivity?.Invoke(message);
+
     private void OnLocalFilesCopied(List<string> paths)
     {
-        if (_config.Role == DeviceRole.Master && _slaves.IsEmpty) return;
-        if (_config.Role == DeviceRole.Slave && _slaveOutboundSender == null) return;
+        var targets = new List<string>();
+        if (_config.Role == DeviceRole.Master)
+        {
+            foreach (var slave in _slaves.Values)
+            {
+                if (!string.IsNullOrWhiteSpace(slave.RemoteIp))
+                    targets.Add(slave.RemoteIp);
+            }
+        }
+        else if (SlaveConnectedToMaster && !string.IsNullOrWhiteSpace(_config.MasterIpAddress))
+        {
+            targets.Add(_config.MasterIpAddress);
+        }
+
+        if (targets.Count == 0) return;
 
         var built = ClipboardSyncManager.BuildFileManifest(paths);
         if (built == null)
         {
-            TransferActivity?.Invoke("Arquivos copiados excedem 512 MB (limite da transferência automática).");
+            TransferActivity?.Invoke("Arquivos copiados excedem 2 GB (limite da transferência automática).");
             return;
         }
 
@@ -142,7 +165,47 @@ public sealed class KvmSessionEngine : IDisposable
         _fileSendCts = CancellationTokenSource.CreateLinkedTokenSource(_runCts?.Token ?? CancellationToken.None);
         var cancel = _fileSendCts.Token;
 
-        _ = Task.Run(() => StreamFilesToPeersAsync(built.Value.Manifest, built.Value.FullPathByRelative, cancel), cancel);
+        _ = Task.Run(() => StreamFilesFastToPeersAsync(targets, built.Value.Manifest, built.Value.FullPathByRelative, cancel), cancel);
+    }
+
+    private async Task StreamFilesFastToPeersAsync(
+        List<string> targetIps,
+        FileTransferManifest manifest,
+        Dictionary<string, string> fullPaths,
+        CancellationToken cancel)
+    {
+        try
+        {
+            var fileCount = manifest.Entries.Count(e => !e.IsDirectory);
+            TransferActivity?.Invoke($"📤 Enviando {fileCount} arquivo(s) ({FormatSize(manifest.TotalBytes)}) em alta velocidade...");
+
+            var cfg = _config;
+            var sentAny = false;
+            foreach (var ip in targetIps)
+            {
+                await LanDiscoveryAndControlService.SendFilesToPeerAsync(
+                    targetIp: ip,
+                    controlPort: cfg.ControlPort,
+                    senderName: cfg.DeviceName,
+                    sessionKey: cfg.SessionKey,
+                    manifest: manifest,
+                    fullPaths: fullPaths,
+                    onProgress: msg => TransferActivity?.Invoke(msg),
+                    cancel: cancel);
+                sentAny = true;
+            }
+
+            if (sentAny)
+                TransferActivity?.Invoke($"✅ {fileCount} arquivo(s) ({FormatSize(manifest.TotalBytes)}) pronto(s)! Aperte Ctrl+V no outro PC.");
+        }
+        catch (OperationCanceledException)
+        {
+            // replaced by a newer copy
+        }
+        catch (Exception ex)
+        {
+            TransferActivity?.Invoke($"Erro ao transferir arquivos: {ex.Message}");
+        }
     }
 
     private async Task BroadcastToPeersAsync(KvmPacketType type, byte[] payload)
@@ -155,65 +218,6 @@ public sealed class KvmSessionEngine : IDisposable
         else if (_slaveOutboundSender is { } send)
         {
             await send(type, payload);
-        }
-    }
-
-    private async Task StreamFilesToPeersAsync(
-        FileTransferManifest manifest,
-        Dictionary<string, string> fullPaths,
-        CancellationToken cancel)
-    {
-        try
-        {
-            TransferActivity?.Invoke($"Enviando {manifest.Entries.Count(e => !e.IsDirectory)} arquivo(s) ({FormatSize(manifest.TotalBytes)})...");
-
-            var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(manifest, ConfigStore.JsonOptions);
-            await BroadcastToPeersAsync(KvmPacketType.FileTransferStart, manifestBytes);
-
-            long sentBytes = 0;
-            int lastPct = -1;
-            var readBuf = new byte[FileChunkBytes];
-
-            for (var i = 0; i < manifest.Entries.Count; i++)
-            {
-                cancel.ThrowIfCancellationRequested();
-                var entry = manifest.Entries[i];
-                if (entry.IsDirectory) continue;
-                if (!fullPaths.TryGetValue(entry.RelativePath, out var diskPath) || !File.Exists(diskPath))
-                    continue;
-
-                await using var fs = new FileStream(diskPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileChunkBytes, useAsync: true);
-                int read;
-                while ((read = await fs.ReadAsync(readBuf, cancel)) > 0)
-                {
-                    var packet = new byte[4 + read];
-                    BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(0, 4), i);
-                    Buffer.BlockCopy(readBuf, 0, packet, 4, read);
-                    await BroadcastToPeersAsync(KvmPacketType.FileTransferChunk, packet);
-
-                    sentBytes += read;
-                    var pct = manifest.TotalBytes > 0 ? (int)(sentBytes * 100 / manifest.TotalBytes) : 100;
-                    if (pct != lastPct && (pct % 10 == 0 || pct == 100))
-                    {
-                        lastPct = pct;
-                        TransferActivity?.Invoke($"Enviando arquivos: {pct}% ({FormatSize(sentBytes)} / {FormatSize(manifest.TotalBytes)})");
-                    }
-
-                    // Yield briefly so interactive mouse/keyboard packets stay silky-smooth
-                    await Task.Yield();
-                }
-            }
-
-            await BroadcastToPeersAsync(KvmPacketType.FileTransferComplete, Encoding.UTF8.GetBytes(manifest.TransferId));
-            TransferActivity?.Invoke("Arquivos enviados! Pode apertar Ctrl+V no outro computador.");
-        }
-        catch (OperationCanceledException)
-        {
-            // replaced by a newer copy
-        }
-        catch (Exception ex)
-        {
-            TransferActivity?.Invoke($"Erro ao transferir arquivos: {ex.Message}");
         }
     }
 
@@ -353,7 +357,8 @@ public sealed class KvmSessionEngine : IDisposable
 
             await WritePacketAsync(ssl, KvmPacketType.AuthOk, "OK"u8.ToArray(), cancel);
 
-            var session = new ConnectedSlaveSession(peerName, width, height, tcp, ssl);
+            var remoteIp = (tcp.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "";
+            var session = new ConnectedSlaveSession(peerName, remoteIp, width, height, tcp, ssl);
             if (_slaves.TryRemove(peerName, out var old)) old.Dispose();
             _slaves[peerName] = session;
             StatusChanged?.Invoke();
@@ -856,7 +861,7 @@ public sealed class KvmSessionEngine : IDisposable
         }
     }
 
-    private sealed class ConnectedSlaveSession(string name, int width, int height, TcpClient tcp, SslStream ssl) : IDisposable
+    private sealed class ConnectedSlaveSession(string name, string remoteIp, int width, int height, TcpClient tcp, SslStream ssl) : IDisposable
     {
         // Coalesce mouse movement to <= 250 Hz (4 ms interval) so 1000 Hz gaming mice never flood
         // Wi-Fi/TCP buffers while always delivering the latest cursor coordinate with zero backlog lag.
@@ -870,6 +875,7 @@ public sealed class KvmSessionEngine : IDisposable
         private volatile bool _disposed;
 
         public string Name { get; } = name;
+        public string RemoteIp { get; } = remoteIp;
         public int Width { get; } = width;
         public int Height { get; } = height;
 
