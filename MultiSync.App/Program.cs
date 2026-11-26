@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.ServiceProcess;
 using MultiSync.Core.Win32;
 
@@ -8,6 +9,8 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High; } catch { }
+
         if (args.Contains("--input-service", StringComparer.OrdinalIgnoreCase))
         {
             ServiceBase.Run(new SystemInputWindowsService());

@@ -327,20 +327,28 @@ public static class SystemSessionInputWorker
         {
             foreach (var cmd in queue.GetConsumingEnumerable(cancel))
             {
-                var now = Environment.TickCount64;
-                if (now - lastCheckTick >= 80 || currentDesktop == nint.Zero)
+                // Coalesce consecutive MouseMove commands already sitting in the queue so the cursor
+                // jumps straight to the newest coordinate with zero backlog lag!
+                var activeCmd = cmd;
+                if (activeCmd[0] == 1)
                 {
-                    lastCheckTick = now;
-                    AttachToActiveInputDesktop(ref currentDesktop);
+                    while (queue.Count > 0 && queue.TryTake(out var next))
+                    {
+                        if (next[0] == 1)
+                        {
+                            activeCmd = next;
+                        }
+                        else
+                        {
+                            // Flush the latest move before executing the non-move (click/key/wheel)
+                            ExecuteWithDesktopRecovery(activeCmd, inputSize, ref currentDesktop, ref lastCheckTick);
+                            activeCmd = next;
+                            break;
+                        }
+                    }
                 }
 
-                var sent = ExecuteCommand(cmd, inputSize);
-                if (sent == 0)
-                {
-                    // Desktop transitioned (Default <-> Winlogon UAC) — switch immediately and retry!
-                    AttachToActiveInputDesktop(ref currentDesktop);
-                    _ = ExecuteCommand(cmd, inputSize);
-                }
+                ExecuteWithDesktopRecovery(activeCmd, inputSize, ref currentDesktop, ref lastCheckTick);
             }
         }
         catch (OperationCanceledException)
@@ -351,6 +359,24 @@ public static class SystemSessionInputWorker
         {
             if (currentDesktop != nint.Zero)
                 CloseDesktop(currentDesktop);
+        }
+    }
+
+    private static void ExecuteWithDesktopRecovery(byte[] cmd, int inputSize, ref nint currentDesktop, ref long lastCheckTick)
+    {
+        var now = Environment.TickCount64;
+        if (currentDesktop == nint.Zero || now - lastCheckTick >= 500)
+        {
+            lastCheckTick = now;
+            AttachToActiveInputDesktop(ref currentDesktop);
+        }
+
+        var sent = ExecuteCommand(cmd, inputSize);
+        if (sent == 0)
+        {
+            // Desktop transitioned (Default <-> Winlogon UAC) — switch immediately and retry!
+            AttachToActiveInputDesktop(ref currentDesktop);
+            _ = ExecuteCommand(cmd, inputSize);
         }
     }
 

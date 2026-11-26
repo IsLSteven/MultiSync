@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="MultiSync — Controle Multi-PC &amp; Layout Visual"
-        Width="1160" Height="740"
-        MinWidth="960" MinHeight="620"
+        Width="1160" Height="780"
+        MinWidth="960" MinHeight="650"
         WindowStartupLocation="CenterScreen"
         Background="#0D1017"
         Foreground="#F3F4F6"
@@ -72,6 +72,8 @@
             <RowDefinition Height="*"/>
             <RowDefinition Height="12"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <!-- HEADER BAR -->
@@ -123,7 +125,7 @@
                               Foreground="#D1D5DB" VerticalAlignment="Center" Margin="0,0,14,0"
                               Click="OnAutoStartChanged"/>
                     <Button Content="Liberar Firewall" Style="{StaticResource ModernButton}"
-                            ToolTip="Libera as portas TCP 5050, UDP 5051 e TCP 5052 na rede local"
+                            ToolTip="Libera as portas TCP 5050, UDP 5051, TCP 5052 e UDP 5053 na rede local"
                             Click="OnOpenFirewallClick"/>
                 </StackPanel>
             </Grid>
@@ -248,8 +250,47 @@
             </Border>
         </Grid>
 
+        <!-- SHARED AUDIO BAR -->
+        <Border Grid.Row="4" Background="#151A24" BorderBrush="#252E42" BorderThickness="1" CornerRadius="10" Padding="14,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,16,0">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="🎧 Áudio Compartilhado (1 Fone para os 2 PCs)" FontSize="13.5" FontWeight="Bold" Foreground="White"/>
+                        <Border x:Name="AudioBadge" Background="#1F2937" CornerRadius="8" Padding="8,2" Margin="10,0,0,0" VerticalAlignment="Center">
+                            <TextBlock x:Name="AudioBadgeText" Text="Desligado" FontSize="11" FontWeight="SemiBold" Foreground="#9CA3AF"/>
+                        </Border>
+                    </StackPanel>
+                    <TextBlock x:Name="AudioStatusText"
+                               Text="Clique no botão ao lado no PC onde seu fone está conectado para ouvir o som do outro PC em tempo real."
+                               FontSize="11.5" Foreground="#9CA3AF" Margin="0,3,0,5"/>
+                    <ProgressBar x:Name="AudioPeakBar" Height="4" Minimum="0" Maximum="100" Value="0"
+                                 Background="#0D1017" Foreground="#10B981" BorderThickness="0"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="AudioMuteButton" Content="🔊" Style="{StaticResource ModernButton}"
+                            Padding="9,6" Margin="0,0,8,0" ToolTip="Silenciar / Ativar som remoto"
+                            Click="OnAudioMuteClick"/>
+                    <Slider x:Name="AudioVolumeSlider" Width="115" Minimum="0" Maximum="150" Value="100"
+                            VerticalAlignment="Center" Margin="0,0,6,0"
+                            ToolTip="Volume do áudio recebido do outro PC"
+                            ValueChanged="OnAudioVolumeChanged"/>
+                    <TextBlock x:Name="AudioVolumeText" Text="100%" Width="38" FontSize="12" FontWeight="SemiBold"
+                               Foreground="#D1D5DB" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                    <Button x:Name="AudioToggleButton" Content="🎧 Ouvir outro PC neste fone"
+                            Style="{StaticResource PrimaryButton}" Padding="14,7"
+                            Click="OnAudioToggleClick"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
         <!-- FOOTER STATUS -->
-        <Border Grid.Row="4" Background="#151A24" BorderBrush="#252E42" BorderThickness="1" CornerRadius="8" Padding="12,8">
+        <Border Grid.Row="6" Background="#151A24" BorderBrush="#252E42" BorderThickness="1" CornerRadius="8" Padding="12,8">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>

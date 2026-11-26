@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.Win32;
+using MultiSync.Core.Audio;
 using MultiSync.Core.Discovery;
 using MultiSync.Core.Models;
 using MultiSync.Core.Network;
@@ -25,6 +26,7 @@ public sealed class AppCoordinator : IDisposable
     public ConfigStore Store { get; }
     public KvmSessionEngine Engine { get; }
     public LanDiscoveryAndControlService Lan { get; }
+    public SharedAudioEngine Audio { get; }
 
     public event Action? StateUpdated;
 
@@ -36,11 +38,36 @@ public sealed class AppCoordinator : IDisposable
         Engine = new KvmSessionEngine(initial);
         Engine.StatusChanged += () => StateUpdated?.Invoke();
 
-        Lan = new LanDiscoveryAndControlService(Store, onRemoteConfigApplied: incoming =>
-        {
-            Engine.Reload(incoming);
-            StateUpdated?.Invoke();
-        });
+        Audio = new SharedAudioEngine();
+        Audio.StatusChanged += () => StateUpdated?.Invoke();
+
+        Lan = new LanDiscoveryAndControlService(
+            Store,
+            onRemoteConfigApplied: incoming =>
+            {
+                Engine.Reload(incoming);
+                StateUpdated?.Invoke();
+            },
+            onAudioControlRequested: (action, receiverIp, audioPort) =>
+            {
+                try
+                {
+                    var cfg = Store.GetSnapshot();
+                    if (string.Equals(action, "start-send", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Audio.StartSending(receiverIp, cfg.SessionKey, audioPort > 0 ? audioPort : SharedAudioEngine.DefaultAudioPort);
+                    }
+                    else if (string.Equals(action, "stop", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Audio.Stop();
+                    }
+                }
+                catch
+                {
+                    // ignore transient audio capture/device errors
+                }
+                StateUpdated?.Invoke();
+            });
         Lan.DevicesUpdated += () => StateUpdated?.Invoke();
     }
 
@@ -156,6 +183,96 @@ public sealed class AppCoordinator : IDisposable
         return (remoteCount, warnings);
     }
 
+    public async Task<(int StartedPeers, List<string> Warnings)> EnableReceiveAudioHereAsync()
+    {
+        var cfg = Store.GetSnapshot();
+        var warnings = new List<string>();
+        if (cfg.PairedDevices.Count == 0)
+        {
+            Audio.Stop();
+            warnings.Add("Nenhum computador pareado encontrado. Pareie o segundo PC na aba lateral primeiro.");
+            return (0, warnings);
+        }
+
+        var myIp = LanAddressHelper.GetPreferredIPv4() ?? "";
+        var audioPort = SharedAudioEngine.DefaultAudioPort;
+        Audio.StartReceiving(cfg.SessionKey, audioPort);
+
+        var discoveredByName = Lan.GetDiscoveredDevices()
+            .ToDictionary(d => d.Name, StringComparer.OrdinalIgnoreCase);
+
+        var started = 0;
+        foreach (var paired in cfg.PairedDevices.Values)
+        {
+            var ip = discoveredByName.TryGetValue(paired.Name, out var live) && !string.IsNullOrWhiteSpace(live.PrimaryAddress)
+                ? live.PrimaryAddress
+                : paired.IpAddress;
+
+            if (string.IsNullOrWhiteSpace(ip))
+            {
+                warnings.Add($"Sem IP conhecido para '{paired.Name}'.");
+                continue;
+            }
+
+            try
+            {
+                await LanDiscoveryAndControlService.SendAudioControlAsync(
+                    targetIp: ip,
+                    controlPort: cfg.ControlPort,
+                    senderName: cfg.DeviceName,
+                    sharedPairSecret: paired.SharedSecret,
+                    action: "start-send",
+                    audioReceiverIp: myIp,
+                    audioPort: audioPort);
+                started++;
+            }
+            catch (Exception ex)
+            {
+                warnings.Add($"Falha ao iniciar áudio em '{paired.Name}' ({ip}): {ex.Message}");
+            }
+        }
+
+        if (started == 0)
+            Audio.Stop();
+
+        StateUpdated?.Invoke();
+        return (started, warnings);
+    }
+
+    public async Task DisableSharedAudioAsync()
+    {
+        Audio.Stop();
+        var cfg = Store.GetSnapshot();
+        var discoveredByName = Lan.GetDiscoveredDevices()
+            .ToDictionary(d => d.Name, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var paired in cfg.PairedDevices.Values)
+        {
+            var ip = discoveredByName.TryGetValue(paired.Name, out var live) && !string.IsNullOrWhiteSpace(live.PrimaryAddress)
+                ? live.PrimaryAddress
+                : paired.IpAddress;
+            if (string.IsNullOrWhiteSpace(ip)) continue;
+
+            try
+            {
+                await LanDiscoveryAndControlService.SendAudioControlAsync(
+                    targetIp: ip,
+                    controlPort: cfg.ControlPort,
+                    senderName: cfg.DeviceName,
+                    sharedPairSecret: paired.SharedSecret,
+                    action: "stop",
+                    audioReceiverIp: "",
+                    audioPort: SharedAudioEngine.DefaultAudioPort);
+            }
+            catch
+            {
+                // best effort stop on peer
+            }
+        }
+
+        StateUpdated?.Invoke();
+    }
+
     public bool IsAutoStartEnabled()
     {
         try
@@ -215,6 +332,7 @@ public sealed class AppCoordinator : IDisposable
             RunNetsh($"advfirewall firewall show rule name=\"MultiSync KVM\" >nul 2>&1 || netsh advfirewall firewall add rule name=\"MultiSync KVM\" dir=in action=allow protocol=TCP localport={cfg.KvmPort}");
             RunNetsh($"advfirewall firewall show rule name=\"MultiSync Discovery\" >nul 2>&1 || netsh advfirewall firewall add rule name=\"MultiSync Discovery\" dir=in action=allow protocol=UDP localport={cfg.DiscoveryPort}");
             RunNetsh($"advfirewall firewall show rule name=\"MultiSync Control\" >nul 2>&1 || netsh advfirewall firewall add rule name=\"MultiSync Control\" dir=in action=allow protocol=TCP localport={cfg.ControlPort}");
+            RunNetsh($"advfirewall firewall show rule name=\"MultiSync Audio\" >nul 2>&1 || netsh advfirewall firewall add rule name=\"MultiSync Audio\" dir=in action=allow protocol=UDP localport={SharedAudioEngine.DefaultAudioPort}");
         }
         catch
         {
@@ -238,7 +356,8 @@ public sealed class AppCoordinator : IDisposable
         var script =
             $"New-NetFirewallRule -DisplayName 'MultiSync KVM (TCP {cfg.KvmPort})' -Direction Inbound -Protocol TCP -LocalPort {cfg.KvmPort} -Action Allow -ErrorAction SilentlyContinue; " +
             $"New-NetFirewallRule -DisplayName 'MultiSync Discovery (UDP {cfg.DiscoveryPort})' -Direction Inbound -Protocol UDP -LocalPort {cfg.DiscoveryPort} -Action Allow -ErrorAction SilentlyContinue; " +
-            $"New-NetFirewallRule -DisplayName 'MultiSync Control (TCP {cfg.ControlPort})' -Direction Inbound -Protocol TCP -LocalPort {cfg.ControlPort} -Action Allow -ErrorAction SilentlyContinue";
+            $"New-NetFirewallRule -DisplayName 'MultiSync Control (TCP {cfg.ControlPort})' -Direction Inbound -Protocol TCP -LocalPort {cfg.ControlPort} -Action Allow -ErrorAction SilentlyContinue; " +
+            $"New-NetFirewallRule -DisplayName 'MultiSync Audio (UDP {SharedAudioEngine.DefaultAudioPort})' -Direction Inbound -Protocol UDP -LocalPort {SharedAudioEngine.DefaultAudioPort} -Action Allow -ErrorAction SilentlyContinue";
 
         Process.Start(new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
         {
@@ -250,6 +369,7 @@ public sealed class AppCoordinator : IDisposable
 
     public void Dispose()
     {
+        Audio.Dispose();
         Lan.Dispose();
         Engine.Dispose();
     }

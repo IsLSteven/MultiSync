@@ -47,12 +47,21 @@ public sealed record PushLayoutMessage(
     string TargetConfigJson,
     string SignatureHex);
 
+public sealed record AudioControlMessage(
+    string SenderName,
+    long UnixSeconds,
+    string Action,
+    string TargetIp,
+    int AudioPort,
+    string SignatureHex);
+
 public sealed record ControlAckMessage(bool Success, string? Error = null);
 
 public sealed class LanDiscoveryAndControlService : IDisposable
 {
     private readonly ConfigStore _store;
     private readonly Action<MultiSyncConfig> _onRemoteConfigApplied;
+    private readonly Action<string, string, int>? _onAudioControlRequested;
     private readonly ConcurrentDictionary<string, LanDeviceBeacon> _discovered = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _instanceId = Guid.NewGuid().ToString("N")[..12];
     private readonly CancellationTokenSource _cts = new();
@@ -62,10 +71,14 @@ public sealed class LanDiscoveryAndControlService : IDisposable
 
     public event Action? DevicesUpdated;
 
-    public LanDiscoveryAndControlService(ConfigStore store, Action<MultiSyncConfig> onRemoteConfigApplied)
+    public LanDiscoveryAndControlService(
+        ConfigStore store,
+        Action<MultiSyncConfig> onRemoteConfigApplied,
+        Action<string, string, int>? onAudioControlRequested = null)
     {
         _store = store;
         _onRemoteConfigApplied = onRemoteConfigApplied;
+        _onAudioControlRequested = onAudioControlRequested;
     }
 
     public void Start()
@@ -141,6 +154,24 @@ public sealed class LanDiscoveryAndControlService : IDisposable
         var ack = await SendControlRpcAsync<PushLayoutMessage, ControlAckMessage>(targetIp, controlPort, "push-layout", msg, cancel);
         if (!ack.Success)
             throw new InvalidOperationException(ack.Error ?? $"Falha ao aplicar configuração em {targetIp}.");
+    }
+
+    public static async Task SendAudioControlAsync(
+        string targetIp,
+        int controlPort,
+        string senderName,
+        string sharedPairSecret,
+        string action,
+        string audioReceiverIp,
+        int audioPort,
+        CancellationToken cancel = default)
+    {
+        var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sig = ConfigStore.ComputeHmacHex(sharedPairSecret, $"audio|{senderName.ToLowerInvariant()}|{ts}|{action}|{audioReceiverIp}|{audioPort}");
+        var msg = new AudioControlMessage(senderName, ts, action, audioReceiverIp, audioPort, sig);
+        var ack = await SendControlRpcAsync<AudioControlMessage, ControlAckMessage>(targetIp, controlPort, "audio-control", msg, cancel);
+        if (!ack.Success)
+            throw new InvalidOperationException(ack.Error ?? $"Falha ao configurar áudio em {targetIp}.");
     }
 
     private LanDeviceBeacon BuildLocalBeacon(string kind)
@@ -361,6 +392,35 @@ public sealed class LanDiscoveryAndControlService : IDisposable
                 await WriteFrameAsync(stream, new ControlAckMessage(true), timeout.Token);
 
                 _ = Task.Run(() => _onRemoteConfigApplied(incoming));
+            }
+            else if (env.Method == "audio-control")
+            {
+                var req = JsonSerializer.Deserialize<AudioControlMessage>(env.BodyJson, ConfigStore.JsonOptions)!;
+                var localCfg = _store.GetSnapshot();
+
+                if (!localCfg.PairedDevices.TryGetValue(req.SenderName, out var paired))
+                {
+                    await WriteFrameAsync(stream, new ControlAckMessage(false, "Dispositivo remetente não está pareado."), timeout.Token);
+                    return;
+                }
+
+                var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (Math.Abs(now - req.UnixSeconds) > 120)
+                {
+                    await WriteFrameAsync(stream, new ControlAckMessage(false, "Timestamp expirado."), timeout.Token);
+                    return;
+                }
+
+                var expectedSig = ConfigStore.ComputeHmacHex(paired.SharedSecret, $"audio|{req.SenderName.ToLowerInvariant()}|{req.UnixSeconds}|{req.Action}|{req.TargetIp}|{req.AudioPort}");
+                if (!ConfigStore.FixedTimeEquals(expectedSig, req.SignatureHex))
+                {
+                    await WriteFrameAsync(stream, new ControlAckMessage(false, "Assinatura HMAC inválida."), timeout.Token);
+                    return;
+                }
+
+                var receiverIp = string.IsNullOrWhiteSpace(req.TargetIp) ? remoteIp : req.TargetIp;
+                await WriteFrameAsync(stream, new ControlAckMessage(true), timeout.Token);
+                _ = Task.Run(() => _onAudioControlRequested?.Invoke(req.Action, receiverIp, req.AudioPort));
             }
         }
     }

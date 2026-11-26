@@ -699,10 +699,7 @@ public sealed class KvmSessionEngine : IDisposable
 
     private static void SendMouseMoveToSlave(ConnectedSlaveSession slave, int x, int y)
     {
-        var buf = new byte[8];
-        BinaryPrimitives.WriteInt32BigEndian(buf.AsSpan(0, 4), x);
-        BinaryPrimitives.WriteInt32BigEndian(buf.AsSpan(4, 4), y);
-        _ = slave.SendAsync(KvmPacketType.MouseMove, buf);
+        slave.QueueMouseMove(x, y);
     }
 
     private static string FormatSize(long bytes)
@@ -724,13 +721,13 @@ public sealed class KvmSessionEngine : IDisposable
 
     private static async Task WritePacketAsync(Stream stream, KvmPacketType type, byte[] payload, CancellationToken cancel)
     {
-        var hdr = new byte[5];
-        hdr[0] = (byte)type;
-        BinaryPrimitives.WriteInt32BigEndian(hdr.AsSpan(1, 4), payload.Length);
-        await stream.WriteAsync(hdr, cancel);
+        // Combine header + payload into a single buffer so SslStream emits ONE TLS record instead of two!
+        var frame = new byte[5 + payload.Length];
+        frame[0] = (byte)type;
+        BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(1, 4), payload.Length);
         if (payload.Length > 0)
-            await stream.WriteAsync(payload, cancel);
-        await stream.FlushAsync(cancel);
+            Buffer.BlockCopy(payload, 0, frame, 5, payload.Length);
+        await stream.WriteAsync(frame, cancel);
     }
 
     private static async Task<(KvmPacketType Type, byte[] Payload)> ReadPacketAsync(Stream stream, CancellationToken cancel)
@@ -861,17 +858,103 @@ public sealed class KvmSessionEngine : IDisposable
 
     private sealed class ConnectedSlaveSession(string name, int width, int height, TcpClient tcp, SslStream ssl) : IDisposable
     {
+        // Coalesce mouse movement to <= 250 Hz (4 ms interval) so 1000 Hz gaming mice never flood
+        // Wi-Fi/TCP buffers while always delivering the latest cursor coordinate with zero backlog lag.
+        private const int MinMouseIntervalMs = 4;
+
         private readonly SemaphoreSlim _writeLock = new(1, 1);
+        private long _packedPendingMove;
+        private int _hasPendingMove;
+        private int _drainScheduled;
+        private long _lastMouseSendTick;
+        private volatile bool _disposed;
 
         public string Name { get; } = name;
         public int Width { get; } = width;
         public int Height { get; } = height;
 
-        public async Task SendAsync(KvmPacketType type, byte[] payload)
+        public void QueueMouseMove(int x, int y)
         {
+            if (_disposed) return;
+            var packed = ((long)x << 32) | (uint)y;
+            Volatile.Write(ref _packedPendingMove, packed);
+            Volatile.Write(ref _hasPendingMove, 1);
+
+            if (Interlocked.CompareExchange(ref _drainScheduled, 1, 0) == 0)
+                _ = DrainPendingMovesAsync();
+        }
+
+        private async Task DrainPendingMovesAsync()
+        {
+            try
+            {
+                while (!_disposed)
+                {
+                    if (Interlocked.Exchange(ref _hasPendingMove, 0) == 0)
+                    {
+                        Volatile.Write(ref _drainScheduled, 0);
+                        // Double-check in case a move landed right before clearing _drainScheduled
+                        if (Volatile.Read(ref _hasPendingMove) == 1 && Interlocked.CompareExchange(ref _drainScheduled, 1, 0) == 0)
+                            continue;
+                        return;
+                    }
+
+                    var elapsed = Environment.TickCount64 - Volatile.Read(ref _lastMouseSendTick);
+                    var waitMs = MinMouseIntervalMs - (int)elapsed;
+                    if (waitMs > 0)
+                        await Task.Delay(waitMs);
+
+                    await FlushLatestMouseMoveLockedAsync();
+                }
+            }
+            catch
+            {
+                Volatile.Write(ref _drainScheduled, 0);
+            }
+        }
+
+        private async Task FlushLatestMouseMoveLockedAsync()
+        {
+            if (_disposed) return;
+            var packed = Volatile.Read(ref _packedPendingMove);
+            var x = (int)(packed >> 32);
+            var y = (int)(uint)packed;
+
+            var frame = new byte[5 + 8];
+            frame[0] = (byte)KvmPacketType.MouseMove;
+            BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(1, 4), 8);
+            BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(5, 4), x);
+            BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(9, 4), y);
+
             await _writeLock.WaitAsync();
             try
             {
+                if (_disposed) return;
+                await ssl.WriteAsync(frame, CancellationToken.None);
+                Volatile.Write(ref _lastMouseSendTick, Environment.TickCount64);
+            }
+            catch { }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
+        public async Task SendAsync(KvmPacketType type, byte[] payload)
+        {
+            if (_disposed) return;
+
+            // Flush any coalesced mouse position BEFORE clicking/scrolling/typing so clicks land at exact cursor pixel!
+            if (type is KvmPacketType.MouseButton or KvmPacketType.MouseWheel or KvmPacketType.KeyEvent &&
+                Interlocked.Exchange(ref _hasPendingMove, 0) == 1)
+            {
+                await FlushLatestMouseMoveLockedAsync();
+            }
+
+            await _writeLock.WaitAsync();
+            try
+            {
+                if (_disposed) return;
                 await WritePacketAsync(ssl, type, payload, CancellationToken.None);
             }
             catch { }
@@ -883,6 +966,7 @@ public sealed class KvmSessionEngine : IDisposable
 
         public void Dispose()
         {
+            _disposed = true;
             try { ssl.Dispose(); } catch { }
             try { tcp.Dispose(); } catch { }
             _writeLock.Dispose();

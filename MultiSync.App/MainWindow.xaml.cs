@@ -6,6 +6,7 @@ using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using MultiSync.App.Services;
+using MultiSync.Core.Audio;
 using MultiSync.Core.Models;
 using WpfBrushes = System.Windows.Media.Brushes;
 using WpfColor = System.Windows.Media.Color;
@@ -24,6 +25,7 @@ public partial class MainWindow : Window
 
     private readonly AppCoordinator _coordinator;
     private readonly DispatcherTimer _timer;
+    private readonly DispatcherTimer _audioMeterTimer;
     private readonly List<DeviceNode> _nodes = [];
     private readonly Dictionary<string, string> _pinInputs = new(StringComparer.OrdinalIgnoreCase);
 
@@ -45,6 +47,18 @@ public partial class MainWindow : Window
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2.5) };
         _timer.Tick += (_, _) => RefreshStatusAndLan();
 
+        _audioMeterTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(80) };
+        _audioMeterTimer.Tick += (_, _) =>
+        {
+            if (_coordinator.Audio.Mode == AudioShareMode.Off)
+            {
+                AudioPeakBar.Value = 0;
+                _audioMeterTimer.Stop();
+                return;
+            }
+            AudioPeakBar.Value = Math.Clamp(_coordinator.Audio.PeakLevel * 100.0, 0, 100);
+        };
+
         Loaded += async (_, _) =>
         {
             LoadNodesFromStore();
@@ -64,6 +78,7 @@ public partial class MainWindow : Window
             return;
         }
         _timer.Stop();
+        _audioMeterTimer.Stop();
         base.OnClosing(e);
     }
 
@@ -156,6 +171,44 @@ public partial class MainWindow : Window
             RenderCanvas();
 
         RenderLanPeersList(peers);
+        RefreshAudioUi();
+    }
+
+    private void RefreshAudioUi()
+    {
+        var audio = _coordinator.Audio;
+        AudioMuteButton.Content = audio.IsMuted ? "🔇" : "🔊";
+
+        if (audio.Mode == AudioShareMode.ReceiveHere)
+        {
+            AudioBadge.Background = new SolidColorBrush(WpfColor.FromRgb(6, 78, 59));
+            AudioBadgeText.Foreground = new SolidColorBrush(WpfColor.FromRgb(110, 231, 183));
+            AudioBadgeText.Text = audio.IsReceivingActive ? "Recebendo ao vivo" : "Aguardando áudio";
+            AudioStatusText.Text = audio.IsMuted
+                ? "Áudio remoto silenciado neste fone (48 kHz Estéreo via UDP 5053)."
+                : "Reproduzindo áudio do outro computador no seu fone em tempo real (48 kHz Estéreo).";
+            AudioToggleButton.Content = "⏹ Desligar Áudio";
+            if (!_audioMeterTimer.IsEnabled) _audioMeterTimer.Start();
+        }
+        else if (audio.Mode == AudioShareMode.SendToPeer)
+        {
+            AudioBadge.Background = new SolidColorBrush(WpfColor.FromRgb(30, 58, 138));
+            AudioBadgeText.Foreground = new SolidColorBrush(WpfColor.FromRgb(147, 197, 253));
+            AudioBadgeText.Text = "Transmitindo";
+            AudioStatusText.Text = $"Enviando o áudio deste PC para {audio.RemoteEndpointIp ?? "o outro PC"} em tempo real (WASAPI Loopback).";
+            AudioToggleButton.Content = "⏹ Parar Transmissão";
+            if (!_audioMeterTimer.IsEnabled) _audioMeterTimer.Start();
+        }
+        else
+        {
+            AudioBadge.Background = new SolidColorBrush(WpfColor.FromRgb(31, 41, 55));
+            AudioBadgeText.Foreground = new SolidColorBrush(WpfColor.FromRgb(156, 163, 175));
+            AudioBadgeText.Text = "Desligado";
+            AudioStatusText.Text = "Clique no botão ao lado no PC onde seu fone está conectado para ouvir o som do outro PC em tempo real.";
+            AudioToggleButton.Content = "🎧 Ouvir outro PC neste fone";
+            AudioPeakBar.Value = 0;
+            if (_audioMeterTimer.IsEnabled) _audioMeterTimer.Stop();
+        }
     }
 
     private void RenderLanPeersList(List<LanPeerItem> peers)
@@ -819,6 +872,55 @@ public partial class MainWindow : Window
         {
             SetStatus($"Erro ao abrir Firewall: {ex.Message}", isWarning: true);
         }
+    }
+
+    private async void OnAudioToggleClick(object sender, RoutedEventArgs e)
+    {
+        AudioToggleButton.IsEnabled = false;
+        try
+        {
+            if (_coordinator.Audio.Mode == AudioShareMode.Off)
+            {
+                var (started, warnings) = await _coordinator.EnableReceiveAudioHereAsync();
+                if (started > 0)
+                {
+                    SetStatus($"🎧 Áudio compartilhado ativado! Ouvindo {started} computador(es) neste fone.");
+                }
+                else
+                {
+                    var warn = warnings.FirstOrDefault() ?? "Não foi possível iniciar o áudio compartilhado.";
+                    SetStatus(warn, isWarning: true);
+                }
+            }
+            else
+            {
+                await _coordinator.DisableSharedAudioAsync();
+                SetStatus("Áudio compartilhado desligado nos dois computadores.");
+            }
+            RefreshAudioUi();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Erro no áudio compartilhado: {ex.Message}", isWarning: true);
+        }
+        finally
+        {
+            AudioToggleButton.IsEnabled = true;
+        }
+    }
+
+    private void OnAudioMuteClick(object sender, RoutedEventArgs e)
+    {
+        _coordinator.Audio.IsMuted = !_coordinator.Audio.IsMuted;
+        RefreshAudioUi();
+    }
+
+    private void OnAudioVolumeChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (AudioVolumeText == null || _coordinator == null) return;
+        var pct = (int)Math.Round(e.NewValue);
+        AudioVolumeText.Text = $"{pct}%";
+        _coordinator.Audio.Volume = (float)(e.NewValue / 100.0);
     }
 
     private void SetStatus(string msg, bool isWarning = false)

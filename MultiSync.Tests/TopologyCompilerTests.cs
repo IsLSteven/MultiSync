@@ -1,6 +1,8 @@
+using MultiSync.Core.Audio;
 using MultiSync.Core.ClipboardSync;
 using MultiSync.Core.Models;
 using MultiSync.Core.Topology;
+using NAudio.Wave;
 using NUnit.Framework;
 
 namespace MultiSync.Tests;
@@ -107,5 +109,28 @@ public class TopologyCompilerTests
         {
             Directory.Delete(tempRoot, recursive: true);
         }
+    }
+
+    [Test]
+    public void SharedAudioEngine_ConvertTo48kStereo16_Resamples44kFloatTo48kPcm16()
+    {
+        // Generate 20 ms of 44.1 kHz 32-bit IEEE float stereo sine wave (882 stereo frames)
+        const int srcRate = 44100;
+        const int frames = 882;
+        var srcFormat = WaveFormat.CreateIeeeFloatWaveFormat(srcRate, 2);
+        var floatBytes = new byte[frames * 2 * sizeof(float)];
+        for (var i = 0; i < frames; i++)
+        {
+            var sample = (float)(0.5 * Math.Sin(2.0 * Math.PI * 440.0 * i / srcRate));
+            BitConverter.TryWriteBytes(floatBytes.AsSpan(i * 8, 4), sample);
+            BitConverter.TryWriteBytes(floatBytes.AsSpan(i * 8 + 4, 4), sample);
+        }
+
+        var pcm16 = SharedAudioEngine.ConvertTo48kStereo16(floatBytes, floatBytes.Length, srcFormat);
+
+        // 20 ms at 48 kHz 16-bit stereo = ~3840 bytes (resampler may vary slightly by a few frames)
+        Assert.That(pcm16.Length, Is.InRange(3500, 4100));
+        Assert.That(pcm16.Length % 4, Is.EqualTo(0));
+        Assert.That(pcm16.Any(b => b != 0), Is.True);
     }
 }
