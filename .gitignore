@@ -1,0 +1,19 @@
+# Build artifacts
+bin/
+obj/
+publish/
+out/
+dist/
+
+# IDE & OS
+.vs/
+.idea/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# Runtime local state
+multisync.json
+.multisync-state.json
+*.log
