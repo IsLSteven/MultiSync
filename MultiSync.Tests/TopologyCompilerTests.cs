@@ -98,6 +98,10 @@ public class TopologyCompilerTests
             Assert.That(built!.Value.Manifest.TotalBytes, Is.EqualTo(11));
             Assert.That(built.Value.Manifest.Entries.Any(e => e.IsDirectory && e.RelativePath == "PastaTeste"), Is.True);
             Assert.That(built.Value.FullPathByRelative.Count, Is.EqualTo(2));
+
+            var dropBuf = ClipboardSyncManager.BuildDropFilesBuffer([f1, f2]);
+            Assert.That(BitConverter.ToInt32(dropBuf, 0), Is.EqualTo(20)); // DROPFILES.pFiles
+            Assert.That(BitConverter.ToInt32(dropBuf, 16), Is.EqualTo(1)); // DROPFILES.fWide = TRUE
         }
         finally
         {

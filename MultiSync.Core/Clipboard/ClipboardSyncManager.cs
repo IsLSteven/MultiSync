@@ -1,4 +1,3 @@
-using System.Collections.Specialized;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
@@ -18,8 +17,9 @@ public sealed record FileTransferEntry(
     bool IsDirectory);
 
 /// <summary>
-/// Watches the Windows clipboard in real time via AddClipboardFormatListener (WM_CLIPBOARDUPDATE)
-/// and handles bidirectional sync of text, images (screenshots), and files/folders (CF_HDROP).
+/// Pure Win32 bidirectional clipboard monitor and writer using GetClipboardSequenceNumber() +
+/// OpenClipboard(HWND_MESSAGE) + GetClipboardData/SetClipboardData.
+/// Supports UTF-16 text (CF_UNICODETEXT), images (PNG + CF_DIB), and files/folders (CF_HDROP + Preferred DropEffect).
 /// </summary>
 public sealed class ClipboardSyncManager : IDisposable
 {
@@ -27,12 +27,27 @@ public sealed class ClipboardSyncManager : IDisposable
     public const int MaxImageBytes = 20 * 1024 * 1024; // 20 MB
     public const int MaxTextChars = 2 * 1024 * 1024;
 
-    private Thread? _staThread;
-    private ClipboardListenerWindow? _window;
-    private readonly ManualResetEventSlim _ready = new();
+    private const uint CF_DIB = 8;
+    private const uint CF_UNICODETEXT = 13;
+    private const uint CF_HDROP = 15;
+    private const uint GMEM_MOVEABLE = 0x0002;
+    private const uint GMEM_ZEROINIT = 0x0040;
+    private const uint GMEM_DDESHARE = 0x2000;
+    private const int OpenRetries = 12;
 
+    private static readonly uint CfPng = RegisterClipboardFormatW("PNG");
+    private static readonly uint CfPreferredDropEffect = RegisterClipboardFormatW("Preferred DropEffect");
+    private static readonly Lock ClipboardLock = new();
+
+    private CancellationTokenSource? _cts;
+    private Task? _pollTask;
+    private OwnerMessageWindow? _ownerWindow;
+    private Thread? _ownerThread;
+    private readonly ManualResetEventSlim _ownerReady = new();
+
+    private uint _lastObservedSequence;
+    private uint _lastWrittenSequence;
     private string _lastContentHash = "";
-    private long _suppressUpdatesUntilTick;
 
     public event Action<string>? LocalTextCopied;
     public event Action<byte[]>? LocalImageCopied;
@@ -40,147 +55,374 @@ public sealed class ClipboardSyncManager : IDisposable
 
     public void Start()
     {
-        if (_staThread != null) return;
-        _staThread = new Thread(() =>
+        if (_cts != null) return;
+        _cts = new CancellationTokenSource();
+
+        // Create a dedicated HWND_MESSAGE window so OpenClipboard(ownerHwnd) always has a valid owner per MSDN
+        _ownerThread = new Thread(() =>
         {
-            _window = new ClipboardListenerWindow(OnClipboardChanged);
-            _ = _window.Handle;
-            _ready.Set();
-            Application.Run(_window);
+            _ownerWindow = new OwnerMessageWindow();
+            _ownerReady.Set();
+            Application.Run();
         })
         {
-            Name = "MultiSync.ClipboardWatcher",
+            Name = "MultiSync.ClipboardOwner",
             IsBackground = true,
         };
-        _staThread.SetApartmentState(ApartmentState.STA);
-        _staThread.Start();
-        _ready.Wait(TimeSpan.FromSeconds(3));
+        _ownerThread.SetApartmentState(ApartmentState.STA);
+        _ownerThread.Start();
+        _ownerReady.Wait(TimeSpan.FromSeconds(2));
+
+        _lastObservedSequence = GetClipboardSequenceNumber();
+        var token = _cts.Token;
+        _pollTask = Task.Run(() => PollLoopAsync(token), token);
     }
 
-    public void ApplyRemoteText(string text)
+    /// <summary>Forces an immediate check of the local clipboard (e.g. when switching screens).</summary>
+    public void CheckNow()
     {
-        if (string.IsNullOrEmpty(text)) return;
+        try { InspectClipboardIfChanged(forceCheck: false); }
+        catch { }
+    }
+
+    public bool ApplyRemoteText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
         var hash = HashString("T:" + text);
-        if (hash == _lastContentHash) return;
+        if (hash == _lastContentHash) return true;
 
-        RunOnSta(() =>
-        {
-            _lastContentHash = hash;
-            _suppressUpdatesUntilTick = Environment.TickCount64 + 600;
-            TryWithRetry(() => Clipboard.SetText(text));
-        });
+        var utf16 = Encoding.Unicode.GetBytes(text + '\0');
+        var ok = WriteClipboard(() => SetGlobalData(CF_UNICODETEXT, utf16), hash);
+        return ok;
     }
 
-    public void ApplyRemoteImagePng(byte[] pngBytes)
+    public bool ApplyRemoteImagePng(byte[] pngBytes)
     {
-        if (pngBytes.Length == 0) return;
+        if (pngBytes.Length == 0) return false;
         var hash = HashBytes("I:", pngBytes);
-        if (hash == _lastContentHash) return;
+        if (hash == _lastContentHash) return true;
 
-        RunOnSta(() =>
+        var dibBytes = TryConvertPngToDib(pngBytes);
+        return WriteClipboard(() =>
         {
-            _lastContentHash = hash;
-            _suppressUpdatesUntilTick = Environment.TickCount64 + 600;
-            TryWithRetry(() =>
-            {
-                using var ms = new MemoryStream(pngBytes);
-                using var img = Image.FromStream(ms);
-                Clipboard.SetImage(new Bitmap(img));
-            });
-        });
+            var wrotePng = CfPng != 0 && SetGlobalData(CfPng, pngBytes);
+            var wroteDib = dibBytes != null && SetGlobalData(CF_DIB, dibBytes);
+            return wrotePng || wroteDib;
+        }, hash);
     }
 
-    public void ApplyRemoteFiles(IReadOnlyList<string> localPaths)
+    public bool ApplyRemoteFiles(IReadOnlyList<string> localPaths)
     {
-        if (localPaths.Count == 0) return;
-        var sig = string.Join("|", localPaths);
-        var hash = HashString("F:" + sig);
+        var valid = localPaths.Where(p => !string.IsNullOrWhiteSpace(p) && (File.Exists(p) || Directory.Exists(p))).ToList();
+        if (valid.Count == 0) return false;
 
-        RunOnSta(() =>
+        var hash = HashString("F:" + string.Join("|", valid));
+        var dropBytes = BuildDropFilesBuffer(valid);
+        var copyEffect = BitConverter.GetBytes(1u); // DROPEFFECT_COPY = 1
+
+        return WriteClipboard(() =>
         {
-            _lastContentHash = hash;
-            _suppressUpdatesUntilTick = Environment.TickCount64 + 800;
-            TryWithRetry(() =>
-            {
-                var col = new StringCollection();
-                foreach (var p in localPaths)
-                    if (File.Exists(p) || Directory.Exists(p))
-                        col.Add(p);
-                if (col.Count > 0)
-                    Clipboard.SetFileDropList(col);
-            });
-        });
+            var okDrop = SetGlobalData(CF_HDROP, dropBytes);
+            if (okDrop && CfPreferredDropEffect != 0)
+                SetGlobalData(CfPreferredDropEffect, copyEffect);
+            return okDrop;
+        }, hash);
     }
 
-    private void OnClipboardChanged()
+    private async Task PollLoopAsync(CancellationToken cancel)
     {
-        if (Environment.TickCount64 <= _suppressUpdatesUntilTick)
+        while (!cancel.IsCancellationRequested)
+        {
+            try
+            {
+                InspectClipboardIfChanged(forceCheck: false);
+            }
+            catch
+            {
+                // ignore transient clipboard lock
+            }
+
+            try { await Task.Delay(120, cancel); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    private void InspectClipboardIfChanged(bool forceCheck)
+    {
+        var seq = GetClipboardSequenceNumber();
+        if (!forceCheck && (seq == _lastObservedSequence || seq == _lastWrittenSequence))
             return;
 
+        _lastObservedSequence = seq;
+
+        List<string>? files = null;
+        string? text = null;
+        byte[]? pngBytes = null;
+
+        lock (ClipboardLock)
+        {
+            if (!TryOpenClipboard(OwnerHwnd))
+                return;
+
+            try
+            {
+                if (IsClipboardFormatAvailable(CF_HDROP))
+                {
+                    files = ReadDropFilesFromOpenClipboard();
+                }
+                else if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+                {
+                    text = ReadUnicodeTextFromOpenClipboard();
+                }
+                else if (CfPng != 0 && IsClipboardFormatAvailable(CfPng))
+                {
+                    pngBytes = ReadGlobalMemory(GetClipboardData(CfPng));
+                }
+                else if (IsClipboardFormatAvailable(CF_DIB))
+                {
+                    var dib = ReadGlobalMemory(GetClipboardData(CF_DIB));
+                    if (dib != null)
+                        pngBytes = TryConvertDibToPng(dib);
+                }
+            }
+            finally
+            {
+                CloseClipboard();
+            }
+        }
+
+        if (files is { Count: > 0 })
+        {
+            var stagingRoot = GetStagingRoot();
+            if (files.All(p => p.StartsWith(stagingRoot, StringComparison.OrdinalIgnoreCase)))
+                return;
+
+            var hash = HashString("F:" + string.Join("|", files));
+            if (hash == _lastContentHash) return;
+            _lastContentHash = hash;
+            LocalFilesCopied?.Invoke(files);
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(text) && text.Length <= MaxTextChars)
+        {
+            var hash = HashString("T:" + text);
+            if (hash == _lastContentHash) return;
+            _lastContentHash = hash;
+            LocalTextCopied?.Invoke(text);
+            return;
+        }
+
+        if (pngBytes is { Length: > 0 and <= MaxImageBytes })
+        {
+            var hash = HashBytes("I:", pngBytes);
+            if (hash == _lastContentHash) return;
+            _lastContentHash = hash;
+            LocalImageCopied?.Invoke(pngBytes);
+        }
+    }
+
+    private bool WriteClipboard(Func<bool> writer, string contentHash)
+    {
+        lock (ClipboardLock)
+        {
+            if (!TryOpenClipboard(OwnerHwnd))
+                return false;
+
+            try
+            {
+                if (!EmptyClipboard())
+                    return false;
+
+                var ok = writer();
+                if (ok)
+                    _lastContentHash = contentHash;
+                return ok;
+            }
+            finally
+            {
+                CloseClipboard();
+                var seq = GetClipboardSequenceNumber();
+                _lastWrittenSequence = seq;
+                _lastObservedSequence = seq;
+            }
+        }
+    }
+
+    private nint OwnerHwnd => _ownerWindow?.Handle ?? nint.Zero;
+
+    private static bool TryOpenClipboard(nint owner)
+    {
+        for (var i = 0; i < OpenRetries; i++)
+        {
+            if (OpenClipboard(owner))
+                return true;
+            Thread.Sleep(15);
+        }
+        return false;
+    }
+
+    private static string? ReadUnicodeTextFromOpenClipboard()
+    {
+        var hMem = GetClipboardData(CF_UNICODETEXT);
+        if (hMem == nint.Zero) return null;
+        var ptr = GlobalLock(hMem);
+        if (ptr == nint.Zero) return null;
         try
         {
-            // 1. Files / Folders (CF_HDROP)
-            if (Clipboard.ContainsFileDropList())
+            return Marshal.PtrToStringUni(ptr);
+        }
+        finally
+        {
+            GlobalUnlock(hMem);
+        }
+    }
+
+    private static unsafe List<string> ReadDropFilesFromOpenClipboard()
+    {
+        var list = new List<string>();
+        var hDrop = GetClipboardData(CF_HDROP);
+        if (hDrop == nint.Zero) return list;
+
+        var count = DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
+        if (count == 0 || count > 2048) return list;
+
+        for (uint i = 0; i < count; i++)
+        {
+            var chars = DragQueryFileW(hDrop, i, null, 0);
+            if (chars == 0) continue;
+            var buf = new char[chars + 1];
+            fixed (char* p = buf)
             {
-                var dropList = Clipboard.GetFileDropList();
-                var paths = new List<string>();
-                foreach (var p in dropList)
+                var written = DragQueryFileW(hDrop, i, p, (uint)buf.Length);
+                if (written > 0)
                 {
-                    if (!string.IsNullOrWhiteSpace(p) && (File.Exists(p) || Directory.Exists(p)))
-                        paths.Add(p);
-                }
-
-                if (paths.Count > 0)
-                {
-                    // Skip files inside our own receive staging folder so we don't bounce them back
-                    var stagingRoot = GetStagingRoot();
-                    if (paths.All(p => p.StartsWith(stagingRoot, StringComparison.OrdinalIgnoreCase)))
-                        return;
-
-                    var hash = HashString("F:" + string.Join("|", paths));
-                    if (hash == _lastContentHash) return;
-                    _lastContentHash = hash;
-                    LocalFilesCopied?.Invoke(paths);
-                    return;
-                }
-            }
-
-            // 2. Text
-            if (Clipboard.ContainsText())
-            {
-                var text = Clipboard.GetText();
-                if (!string.IsNullOrEmpty(text) && text.Length <= MaxTextChars)
-                {
-                    var hash = HashString("T:" + text);
-                    if (hash == _lastContentHash) return;
-                    _lastContentHash = hash;
-                    LocalTextCopied?.Invoke(text);
-                    return;
-                }
-            }
-
-            // 3. Images (e.g. Win+Shift+S, PrintScreen, Copy Image)
-            if (Clipboard.ContainsImage())
-            {
-                using var img = Clipboard.GetImage();
-                if (img != null)
-                {
-                    using var ms = new MemoryStream();
-                    img.Save(ms, ImageFormat.Png);
-                    var bytes = ms.ToArray();
-                    if (bytes.Length > 0 && bytes.Length <= MaxImageBytes)
-                    {
-                        var hash = HashBytes("I:", bytes);
-                        if (hash == _lastContentHash) return;
-                        _lastContentHash = hash;
-                        LocalImageCopied?.Invoke(bytes);
-                    }
+                    var path = new string(buf, 0, (int)written);
+                    if (File.Exists(path) || Directory.Exists(path))
+                        list.Add(path);
                 }
             }
         }
+        return list;
+    }
+
+    /// <summary>
+    /// Builds a valid Win32 DROPFILES (CF_HDROP) memory block: 20-byte header + UTF-16LE null-terminated paths + final NUL.
+    /// </summary>
+    public static byte[] BuildDropFilesBuffer(IReadOnlyList<string> paths)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
+        bw.Write(20); // pFiles offset
+        bw.Write(0);  // pt.x
+        bw.Write(0);  // pt.y
+        bw.Write(0);  // fNC = FALSE
+        bw.Write(1);  // fWide = TRUE (UTF-16LE)
+        foreach (var path in paths)
+        {
+            bw.Write(Encoding.Unicode.GetBytes(path));
+            bw.Write((short)0);
+        }
+        bw.Write((short)0); // double-NUL terminator
+        return ms.ToArray();
+    }
+
+    private static byte[]? ReadGlobalMemory(nint hMem)
+    {
+        if (hMem == nint.Zero) return null;
+        var size = (int)GlobalSize(hMem);
+        if (size <= 0 || size > MaxImageBytes) return null;
+        var ptr = GlobalLock(hMem);
+        if (ptr == nint.Zero) return null;
+        try
+        {
+            var data = new byte[size];
+            Marshal.Copy(ptr, data, 0, size);
+            return data;
+        }
+        finally
+        {
+            GlobalUnlock(hMem);
+        }
+    }
+
+    private static bool SetGlobalData(uint format, byte[] data)
+    {
+        var hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT | GMEM_DDESHARE, (nuint)data.Length);
+        if (hMem == nint.Zero) return false;
+        var ptr = GlobalLock(hMem);
+        if (ptr == nint.Zero)
+        {
+            GlobalFree(hMem);
+            return false;
+        }
+        try
+        {
+            Marshal.Copy(data, 0, ptr, data.Length);
+        }
+        finally
+        {
+            GlobalUnlock(hMem);
+        }
+
+        if (SetClipboardData(format, hMem) != nint.Zero)
+            return true;
+
+        GlobalFree(hMem);
+        return false;
+    }
+
+    private static byte[]? TryConvertDibToPng(byte[] dib)
+    {
+        try
+        {
+            if (dib.Length < 40) return null;
+            var headerSize = BitConverter.ToInt32(dib, 0);
+            var bpp = BitConverter.ToInt16(dib, 14);
+            var compression = BitConverter.ToInt32(dib, 16);
+            var clrUsed = BitConverter.ToInt32(dib, 32);
+
+            var paletteBytes = clrUsed > 0 ? clrUsed * 4 : (bpp <= 8 ? (1 << bpp) * 4 : 0);
+            var maskBytes = (headerSize == 40 && compression == 3) ? 12 : 0;
+            var pixelOffset = 14 + headerSize + paletteBytes + maskBytes;
+
+            var bmpFile = new byte[14 + dib.Length];
+            bmpFile[0] = (byte)'B';
+            bmpFile[1] = (byte)'M';
+            BitConverter.TryWriteBytes(bmpFile.AsSpan(2, 4), bmpFile.Length);
+            BitConverter.TryWriteBytes(bmpFile.AsSpan(10, 4), pixelOffset);
+            Buffer.BlockCopy(dib, 0, bmpFile, 14, dib.Length);
+
+            using var inMs = new MemoryStream(bmpFile);
+            using var img = Image.FromStream(inMs);
+            using var outMs = new MemoryStream();
+            img.Save(outMs, ImageFormat.Png);
+            return outMs.ToArray();
+        }
         catch
         {
-            // Clipboard temporarily locked by another app — ignore cleanly
+            return null;
+        }
+    }
+
+    private static byte[]? TryConvertPngToDib(byte[] png)
+    {
+        try
+        {
+            using var inMs = new MemoryStream(png);
+            using var img = Image.FromStream(inMs);
+            using var bmpMs = new MemoryStream();
+            img.Save(bmpMs, ImageFormat.Bmp);
+            var bmpBytes = bmpMs.ToArray();
+            if (bmpBytes.Length <= 14) return null;
+            // Strip 14-byte BITMAPFILEHEADER to get CF_DIB
+            var dib = new byte[bmpBytes.Length - 14];
+            Buffer.BlockCopy(bmpBytes, 14, dib, 0, dib.Length);
+            return dib;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -258,29 +500,6 @@ public sealed class ClipboardSyncManager : IDisposable
         catch { }
     }
 
-    private void RunOnSta(Action action)
-    {
-        var win = _window;
-        if (win == null || win.IsDisposed || !win.IsHandleCreated) return;
-        try { win.BeginInvoke(action); } catch { }
-    }
-
-    private static void TryWithRetry(Action action)
-    {
-        for (var i = 0; i < 4; i++)
-        {
-            try
-            {
-                action();
-                return;
-            }
-            catch
-            {
-                Thread.Sleep(25);
-            }
-        }
-    }
-
     private static string HashString(string value) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
 
@@ -295,57 +514,75 @@ public sealed class ClipboardSyncManager : IDisposable
 
     public void Dispose()
     {
-        var win = _window;
-        if (win != null && !win.IsDisposed && win.IsHandleCreated)
-        {
-            try { win.BeginInvoke(() => win.Close()); } catch { }
-        }
-        _staThread?.Join(TimeSpan.FromSeconds(1));
-        _ready.Dispose();
+        _cts?.Cancel();
+        try { _pollTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
+        _cts?.Dispose();
+        _ownerWindow?.Dispose();
+        _ownerReady.Dispose();
     }
 
-    private sealed class ClipboardListenerWindow : Form
+    private sealed class OwnerMessageWindow : NativeWindow, IDisposable
     {
-        private const int WM_CLIPBOARDUPDATE = 0x031D;
-        private readonly Action _onChanged;
-
-        [DllImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool AddClipboardFormatListener(nint hwnd);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool RemoveClipboardFormatListener(nint hwnd);
-
-        public ClipboardListenerWindow(Action onChanged)
+        public OwnerMessageWindow()
         {
-            _onChanged = onChanged;
-            ShowInTaskbar = false;
-            FormBorderStyle = FormBorderStyle.None;
-            WindowState = FormWindowState.Minimized;
-            Opacity = 0;
-            Size = new Size(1, 1);
+            CreateHandle(new CreateParams
+            {
+                Caption = "MultiSyncClipboardOwner",
+                Parent = new nint(-3), // HWND_MESSAGE
+            });
         }
 
-        protected override void SetVisibleCore(bool value) => base.SetVisibleCore(false);
-
-        protected override void OnHandleCreated(EventArgs e)
+        public void Dispose()
         {
-            base.OnHandleCreated(e);
-            AddClipboardFormatListener(Handle);
-        }
-
-        protected override void OnHandleDestroyed(EventArgs e)
-        {
-            RemoveClipboardFormatListener(Handle);
-            base.OnHandleDestroyed(e);
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == WM_CLIPBOARDUPDATE)
-                _onChanged();
-            base.WndProc(ref m);
+            if (Handle != nint.Zero)
+                DestroyHandle();
         }
     }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenClipboard(nint hWndNewOwner);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EmptyClipboard();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsClipboardFormatAvailable(uint format);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern nint GetClipboardData(uint uFormat);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern nint SetClipboardData(uint uFormat, nint hMem);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterClipboardFormatW(string lpszFormat);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint GlobalAlloc(uint uFlags, nuint dwBytes);
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GlobalFree(nint hMem);
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GlobalLock(nint hMem);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(nint hMem);
+
+    [DllImport("kernel32.dll")]
+    private static extern nuint GlobalSize(nint hMem);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern unsafe uint DragQueryFileW(nint hDrop, uint iFile, char* lpszFile, uint cch);
 }

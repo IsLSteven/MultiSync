@@ -116,11 +116,13 @@ public sealed class KvmSessionEngine : IDisposable
     {
         var bytes = Encoding.UTF8.GetBytes(text);
         _ = BroadcastToPeersAsync(KvmPacketType.ClipboardText, bytes);
+        TransferActivity?.Invoke($"Texto copiado sincronizado ({text.Length} caracteres).");
     }
 
     private void OnLocalImageCopied(byte[] pngBytes)
     {
         _ = BroadcastToPeersAsync(KvmPacketType.ClipboardImage, pngBytes);
+        TransferActivity?.Invoke($"Imagem copiada sincronizada ({FormatSize(pngBytes.Length)}).");
     }
 
     private void OnLocalFilesCopied(List<string> paths)
@@ -223,11 +225,13 @@ public sealed class KvmSessionEngine : IDisposable
         switch (pktType)
         {
             case KvmPacketType.ClipboardText:
-                _clipboard?.ApplyRemoteText(Encoding.UTF8.GetString(data));
+                if (_clipboard?.ApplyRemoteText(Encoding.UTF8.GetString(data)) == true)
+                    TransferActivity?.Invoke("Texto recebido na área de transferência! Aperte Ctrl+V.");
                 break;
 
             case KvmPacketType.ClipboardImage:
-                _clipboard?.ApplyRemoteImagePng(data);
+                if (_clipboard?.ApplyRemoteImagePng(data) == true)
+                    TransferActivity?.Invoke($"Imagem recebida ({FormatSize(data.Length)})! Aperte Ctrl+V.");
                 break;
 
             case KvmPacketType.FileTransferStart:
@@ -573,6 +577,7 @@ public sealed class KvmSessionEngine : IDisposable
 
         _capture?.EnterRemoteCapture(edgeX, edgeY);
         SendMouseMoveToSlave(slave, entryX, entryY);
+        _clipboard?.CheckNow();
         StatusChanged?.Invoke();
     }
 

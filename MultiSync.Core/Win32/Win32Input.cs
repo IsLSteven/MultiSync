@@ -745,10 +745,14 @@ public static class SlaveInputInjector
         if (extended) flags |= Win32Native.KEYEVENTF_EXTENDEDKEY;
         var uni = (unicodeChar != '\0' && isDown) ? (ushort)unicodeChar : (ushort)0;
 
+        // When injecting a real Virtual Key (including Ctrl+C / Ctrl+V / Alt+Tab / Shift), pass wScan = 0
+        // so Windows maps the VK cleanly without layout scan-code conflicts.
+        var effectiveScan = uni != 0 ? scan : (ushort)0;
+
         Span<byte> cmd = stackalloc byte[12];
         cmd[0] = 4;
         System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(cmd.Slice(1, 2), vk);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(cmd.Slice(3, 2), scan);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(cmd.Slice(3, 2), effectiveScan);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(cmd.Slice(5, 4), flags);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(cmd.Slice(9, 2), uni);
         if (SystemInputBridgeClient.TrySendCommand(cmd))
@@ -773,7 +777,7 @@ public static class SlaveInputInjector
         var keyInput = new Win32Native.INPUT
         {
             Type = Win32Native.INPUT_KEYBOARD,
-            Ki = new Win32Native.KEYBDINPUT { Vk = vk, Scan = scan, Flags = flags },
+            Ki = new Win32Native.KEYBDINPUT { Vk = vk, Scan = 0, Flags = flags },
         };
         Win32Native.SendInput(1, [keyInput], InputSize);
     }
