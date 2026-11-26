@@ -58,4 +58,24 @@ public class TopologyCompilerTests
         Assert.That(ConfigStore.FixedTimeEquals(mac1, mac2), Is.True);
         Assert.That(ConfigStore.FixedTimeEquals(mac1, macWrong), Is.False);
     }
+
+    [Test]
+    public void ComputeEntryPoint_EntersFromCorrespondingEdgeNotCenter()
+    {
+        // Crossing Right edge at top-right (1919, 120) -> lands at Left edge (x=2, y=120) on destination!
+        var fromRight = TopologyCompiler.ComputeEntryPoint(ScreenSide.Right, 1919, 120, 0, 0, 1920, 1080, 1920, 1080);
+        Assert.That(fromRight, Is.EqualTo((2, 120)));
+
+        // Crossing Left edge at bottom-left (0, 950) -> lands at Right edge (x=1917, y=950) on destination!
+        var fromLeft = TopologyCompiler.ComputeEntryPoint(ScreenSide.Left, 0, 950, 0, 0, 1920, 1080, 1920, 1080);
+        Assert.That(fromLeft, Is.EqualTo((1917, 950)));
+
+        // Crossing Up edge at (400, 0) -> lands at Bottom edge (x=400, y=1077) on destination!
+        var fromUp = TopologyCompiler.ComputeEntryPoint(ScreenSide.Up, 400, 0, 0, 0, 1920, 1080, 1920, 1080);
+        Assert.That(fromUp, Is.EqualTo((400, 1077)));
+
+        // Crossing Down edge at (400, 1079) -> lands at Top edge (x=400, y=2) on destination!
+        var fromDown = TopologyCompiler.ComputeEntryPoint(ScreenSide.Down, 400, 1079, 0, 0, 1920, 1080, 1920, 1080);
+        Assert.That(fromDown, Is.EqualTo((400, 2)));
+    }
 }

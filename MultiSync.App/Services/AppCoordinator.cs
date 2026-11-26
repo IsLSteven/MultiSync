@@ -46,6 +46,7 @@ public sealed class AppCoordinator : IDisposable
 
     public void StartAll()
     {
+        _ = Task.Run(EnsureFirewallRulesSilent);
         Engine.Start();
         Lan.Start();
     }
@@ -157,24 +158,78 @@ public sealed class AppCoordinator : IDisposable
 
     public bool IsAutoStartEnabled()
     {
+        try
+        {
+            using var proc = Process.Start(new ProcessStartInfo("schtasks.exe", "/Query /TN \"MultiSyncAutoStart\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            });
+            proc?.WaitForExit(2000);
+            if (proc?.ExitCode == 0) return true;
+        }
+        catch { }
+
         using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegKey, writable: false);
         return key?.GetValue(AutoStartValueName) is string s && !string.IsNullOrWhiteSpace(s);
     }
 
     public void SetAutoStart(bool enable)
     {
-        using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegKey, writable: true);
-        if (key == null) return;
-        if (enable)
+        var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+        if (enable && !string.IsNullOrWhiteSpace(exe))
         {
-            var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
-            if (!string.IsNullOrWhiteSpace(exe))
-                key.SetValue(AutoStartValueName, $"\"{exe}\" --minimized");
+            using var proc = Process.Start(new ProcessStartInfo(
+                "schtasks.exe",
+                $"/Create /TN \"MultiSyncAutoStart\" /TR \"\\\"{exe}\\\" --minimized\" /SC ONLOGON /RL HIGHEST /F")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            });
+            proc?.WaitForExit(3000);
         }
         else
         {
-            key.DeleteValue(AutoStartValueName, throwOnMissingValue: false);
+            using var proc = Process.Start(new ProcessStartInfo("schtasks.exe", "/Delete /TN \"MultiSyncAutoStart\" /F")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            });
+            proc?.WaitForExit(3000);
+            using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegKey, writable: true);
+            key?.DeleteValue(AutoStartValueName, throwOnMissingValue: false);
         }
+    }
+
+    private void EnsureFirewallRulesSilent()
+    {
+        try
+        {
+            var cfg = Store.GetSnapshot();
+            RunNetsh($"advfirewall firewall show rule name=\"MultiSync KVM\" >nul 2>&1 || netsh advfirewall firewall add rule name=\"MultiSync KVM\" dir=in action=allow protocol=TCP localport={cfg.KvmPort}");
+            RunNetsh($"advfirewall firewall show rule name=\"MultiSync Discovery\" >nul 2>&1 || netsh advfirewall firewall add rule name=\"MultiSync Discovery\" dir=in action=allow protocol=UDP localport={cfg.DiscoveryPort}");
+            RunNetsh($"advfirewall firewall show rule name=\"MultiSync Control\" >nul 2>&1 || netsh advfirewall firewall add rule name=\"MultiSync Control\" dir=in action=allow protocol=TCP localport={cfg.ControlPort}");
+        }
+        catch
+        {
+            // ignore if non-elevated
+        }
+    }
+
+    private static void RunNetsh(string cmdChain)
+    {
+        using var p = Process.Start(new ProcessStartInfo("cmd.exe", $"/c netsh {cmdChain}")
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false,
+        });
+        p?.WaitForExit(4000);
     }
 
     public void OpenFirewallPorts()

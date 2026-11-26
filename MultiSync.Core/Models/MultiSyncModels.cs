@@ -68,7 +68,7 @@ public sealed class MultiSyncConfig
     public string SessionKey { get; set; } = "";
     public string? MasterIpAddress { get; set; }
     public bool BlockFullscreenEdge { get; set; } = true;
-    public int DeadCornerPixels { get; set; } = 30;
+    public int DeadCornerPixels { get; set; } = 0;
     public List<DeviceNode> LayoutNodes { get; set; } = [];
     public Dictionary<string, PairedDeviceRecord> PairedDevices { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
@@ -187,6 +187,7 @@ public sealed class ConfigStore
         if (cfg.KvmPort <= 0) cfg.KvmPort = MultiSyncConfig.DefaultKvmPort;
         if (cfg.DiscoveryPort <= 0) cfg.DiscoveryPort = MultiSyncConfig.DefaultDiscoveryPort;
         if (cfg.ControlPort <= 0) cfg.ControlPort = MultiSyncConfig.DefaultControlPort;
+        if (cfg.DeadCornerPixels == 30) cfg.DeadCornerPixels = 0;
 
         var caseInsensitive = new Dictionary<string, PairedDeviceRecord>(StringComparer.OrdinalIgnoreCase);
         foreach (var kv in cfg.PairedDevices)

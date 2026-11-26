@@ -8,6 +8,10 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <UseWPF>true</UseWPF>
         <UseWindowsForms>true</UseWindowsForms>
+        <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+        <ApplicationManifest>app.manifest</ApplicationManifest>
+        <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+        <StartupObject>MultiSync.App.Program</StartupObject>
         <AssemblyName>MultiSync</AssemblyName>
         <Product>MultiSync</Product>
         <Description>MultiSync — Plataforma integrada de controle Multi-PC para Windows</Description>

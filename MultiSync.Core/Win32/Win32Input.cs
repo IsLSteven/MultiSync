@@ -304,6 +304,7 @@ public sealed class MasterInputCapture : IDisposable
     private readonly ManualResetEventSlim _ready = new();
 
     private volatile bool _isCapturingRemote;
+    private volatile bool _awaitingParkArrival;
     private int _parkX = 960;
     private int _parkY = 540;
 
@@ -335,6 +336,7 @@ public sealed class MasterInputCapture : IDisposable
     {
         _parkX = parkX;
         _parkY = parkY;
+        _awaitingParkArrival = true;
         _isCapturingRemote = true;
         Win32Native.SetCursorPos(parkX, parkY);
         ShowShield(true);
@@ -343,6 +345,7 @@ public sealed class MasterInputCapture : IDisposable
     public void ExitRemoteCapture(int landingX, int landingY)
     {
         _isCapturingRemote = false;
+        _awaitingParkArrival = false;
         ShowShield(false);
         Win32Native.SetCursorPos(landingX, landingY);
     }
@@ -409,8 +412,30 @@ public sealed class MasterInputCapture : IDisposable
         {
             if (_isCapturingRemote)
             {
+                if (info.Pt.X == _parkX && info.Pt.Y == _parkY)
+                {
+                    _awaitingParkArrival = false;
+                    return 1;
+                }
+
+                // Discard pre-warp mouse samples queued near the screen edge before SetCursorPos(_parkX, _parkY)
+                // landed; otherwise (edgeX - parkX) adds ~960px and teleports the remote cursor to screen center!
+                if (_awaitingParkArrival)
+                {
+                    Win32Native.SetCursorPos(_parkX, _parkY);
+                    return 1;
+                }
+
                 var dx = info.Pt.X - _parkX;
                 var dy = info.Pt.Y - _parkY;
+
+                // Guard against any late OS warp-echo spike (> 350px in a single USB sample)
+                if (Math.Abs(dx) > 350 || Math.Abs(dy) > 350)
+                {
+                    Win32Native.SetCursorPos(_parkX, _parkY);
+                    return 1;
+                }
+
                 if (dx != 0 || dy != 0)
                 {
                     RemoteMouseDelta?.Invoke(dx, dy);
@@ -575,6 +600,13 @@ public static class SlaveInputInjector
         var normX = ((x - vLeft) * 65535 + (vWidth - 1) / 2) / (vWidth - 1);
         var normY = ((y - vTop) * 65535 + (vHeight - 1) / 2) / (vHeight - 1);
 
+        Span<byte> cmd = stackalloc byte[12];
+        cmd[0] = 1;
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(cmd.Slice(1, 4), normX);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(cmd.Slice(5, 4), normY);
+        if (SystemInputBridgeClient.TrySendCommand(cmd))
+            return;
+
         var input = new Win32Native.INPUT
         {
             Type = Win32Native.INPUT_MOUSE,
@@ -601,6 +633,13 @@ public static class SlaveInputInjector
         };
         if (flag == 0) return;
 
+        Span<byte> cmd = stackalloc byte[12];
+        cmd[0] = 2;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(cmd.Slice(1, 4), flag);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(cmd.Slice(5, 4), data);
+        if (SystemInputBridgeClient.TrySendCommand(cmd))
+            return;
+
         var input = new Win32Native.INPUT
         {
             Type = Win32Native.INPUT_MOUSE,
@@ -611,38 +650,54 @@ public static class SlaveInputInjector
 
     public static void InjectMouseWheel(int delta, bool horizontal)
     {
+        var flags = horizontal ? Win32Native.MOUSEEVENTF_HWHEEL : Win32Native.MOUSEEVENTF_WHEEL;
+        var rawDelta = unchecked((uint)delta);
+
+        Span<byte> cmd = stackalloc byte[12];
+        cmd[0] = 3;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(cmd.Slice(1, 4), flags);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(cmd.Slice(5, 4), rawDelta);
+        if (SystemInputBridgeClient.TrySendCommand(cmd))
+            return;
+
         var input = new Win32Native.INPUT
         {
             Type = Win32Native.INPUT_MOUSE,
-            Mi = new Win32Native.MOUSEINPUT
-            {
-                Flags = horizontal ? Win32Native.MOUSEEVENTF_HWHEEL : Win32Native.MOUSEEVENTF_WHEEL,
-                MouseData = unchecked((uint)delta),
-            },
+            Mi = new Win32Native.MOUSEINPUT { Flags = flags, MouseData = rawDelta },
         };
         Win32Native.SendInput(1, [input], InputSize);
     }
 
     public static void InjectKey(ushort vk, ushort scan, bool isDown, bool extended, char unicodeChar)
     {
-        if (unicodeChar != '\0' && isDown)
+        var flags = isDown ? 0u : Win32Native.KEYEVENTF_KEYUP;
+        if (extended) flags |= Win32Native.KEYEVENTF_EXTENDEDKEY;
+        var uni = (unicodeChar != '\0' && isDown) ? (ushort)unicodeChar : (ushort)0;
+
+        Span<byte> cmd = stackalloc byte[12];
+        cmd[0] = 4;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(cmd.Slice(1, 2), vk);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(cmd.Slice(3, 2), scan);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(cmd.Slice(5, 4), flags);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(cmd.Slice(9, 2), uni);
+        if (SystemInputBridgeClient.TrySendCommand(cmd))
+            return;
+
+        if (uni != 0)
         {
             var down = new Win32Native.INPUT
             {
                 Type = Win32Native.INPUT_KEYBOARD,
-                Ki = new Win32Native.KEYBDINPUT { Scan = unicodeChar, Flags = Win32Native.KEYEVENTF_UNICODE },
+                Ki = new Win32Native.KEYBDINPUT { Scan = uni, Flags = Win32Native.KEYEVENTF_UNICODE },
             };
             var up = new Win32Native.INPUT
             {
                 Type = Win32Native.INPUT_KEYBOARD,
-                Ki = new Win32Native.KEYBDINPUT { Scan = unicodeChar, Flags = Win32Native.KEYEVENTF_UNICODE | Win32Native.KEYEVENTF_KEYUP },
+                Ki = new Win32Native.KEYBDINPUT { Scan = uni, Flags = Win32Native.KEYEVENTF_UNICODE | Win32Native.KEYEVENTF_KEYUP },
             };
             Win32Native.SendInput(2, [down, up], InputSize);
             return;
         }
-
-        var flags = isDown ? 0u : Win32Native.KEYEVENTF_KEYUP;
-        if (extended) flags |= Win32Native.KEYEVENTF_EXTENDEDKEY;
 
         var keyInput = new Win32Native.INPUT
         {

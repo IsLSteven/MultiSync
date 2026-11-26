@@ -16,7 +16,7 @@ public static class TopologyCompiler
         int discoveryPort = MultiSyncConfig.DefaultDiscoveryPort,
         int controlPort = MultiSyncConfig.DefaultControlPort,
         bool blockFullscreenEdge = true,
-        int deadCornerPixels = 30)
+        int deadCornerPixels = 0)
     {
         if (nodes.Count == 0)
             throw new InvalidOperationException("O layout precisa ter pelo menos um computador.");
@@ -83,6 +83,37 @@ public static class TopologyCompiler
         ScreenSide.Down => ScreenSide.Up,
         _ => ScreenSide.Right,
     };
+
+    /// <summary>
+    /// Computes the exact pixel coordinate on the destination screen corresponding to the edge
+    /// and proportional position where the cursor exited the source screen.
+    /// </summary>
+    public static (int X, int Y) ComputeEntryPoint(
+        ScreenSide exitSide,
+        int srcX,
+        int srcY,
+        int srcLeft,
+        int srcTop,
+        int srcWidth,
+        int srcHeight,
+        int dstWidth,
+        int dstHeight)
+    {
+        var ratioX = Math.Clamp((double)(srcX - srcLeft) / Math.Max(1, srcWidth - 1), 0.0, 1.0);
+        var ratioY = Math.Clamp((double)(srcY - srcTop) / Math.Max(1, srcHeight - 1), 0.0, 1.0);
+
+        var maxDstX = Math.Max(1, dstWidth - 1);
+        var maxDstY = Math.Max(1, dstHeight - 1);
+
+        return exitSide switch
+        {
+            ScreenSide.Right => (2, (int)Math.Round(ratioY * maxDstY)),
+            ScreenSide.Left => (Math.Max(0, maxDstX - 2), (int)Math.Round(ratioY * maxDstY)),
+            ScreenSide.Down => ((int)Math.Round(ratioX * maxDstX), 2),
+            ScreenSide.Up => ((int)Math.Round(ratioX * maxDstX), Math.Max(0, maxDstY - 2)),
+            _ => (dstWidth / 2, dstHeight / 2),
+        };
+    }
 
     private static List<ScreenLink> ComputeLinksForNode(DeviceNode from, IReadOnlyList<DeviceNode> all)
     {

@@ -360,24 +360,26 @@ public sealed class KvmSessionEngine : IDisposable
         _remoteWidth = slave.Width;
         _remoteHeight = slave.Height;
 
-        var ratioX = Math.Clamp((double)(localX - localBounds.Left) / Math.Max(1, localBounds.Width), 0, 1);
-        var ratioY = Math.Clamp((double)(localY - localBounds.Top) / Math.Max(1, localBounds.Height), 0, 1);
+        var (entryX, entryY) = TopologyCompiler.ComputeEntryPoint(
+            exitSide,
+            localX,
+            localY,
+            localBounds.Left,
+            localBounds.Top,
+            localBounds.Width,
+            localBounds.Height,
+            _remoteWidth,
+            _remoteHeight);
 
-        (_remoteCursorX, _remoteCursorY) = exitSide switch
-        {
-            ScreenSide.Right => (2, ratioY * (_remoteHeight - 1)),
-            ScreenSide.Left => (_remoteWidth - 3, ratioY * (_remoteHeight - 1)),
-            ScreenSide.Down => (ratioX * (_remoteWidth - 1), 2),
-            ScreenSide.Up => (ratioX * (_remoteWidth - 1), _remoteHeight - 3),
-            _ => (_remoteWidth / 2.0, _remoteHeight / 2.0),
-        };
+        _remoteCursorX = entryX;
+        _remoteCursorY = entryY;
 
         PushLocalClipboardIfChanged(slave);
 
         var parkX = localBounds.Left + localBounds.Width / 2;
         var parkY = localBounds.Top + localBounds.Height / 2;
         _capture?.EnterRemoteCapture(parkX, parkY);
-        SendMouseMoveToSlave(slave, (int)_remoteCursorX, (int)_remoteCursorY);
+        SendMouseMoveToSlave(slave, entryX, entryY);
         StatusChanged?.Invoke();
     }
 
