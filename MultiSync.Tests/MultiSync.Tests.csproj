@@ -16,6 +16,7 @@
 
     <ItemGroup>
         <ProjectReference Include="../MultiSync.Core/MultiSync.Core.csproj" />
+        <ProjectReference Include="../MultiSync.Linux/MultiSync.Linux.csproj" />
     </ItemGroup>
 
 </Project>

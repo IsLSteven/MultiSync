@@ -204,4 +204,23 @@ public class TopologyCompilerTests
         Assert.That(frame.JpegBytes[0], Is.EqualTo(0xFF));
         Assert.That(frame.JpegBytes[1], Is.EqualTo(0xD8));
     }
+
+    [Test]
+    public void LinuxInterop_KeyMapAndHmacProtocolMatchWindows()
+    {
+        // Windows VK_C (0x43) -> Linux KEY_C (46) -> X11 keycode (54) -> roundtrip back to 0x43
+        var evC = MultiSync.Linux.Input.LinuxKeyMap.ToEvdevCode(0x43);
+        Assert.That(evC, Is.EqualTo(46));
+        Assert.That(MultiSync.Linux.Input.LinuxKeyMap.ToX11KeyCode(0x43), Is.EqualTo(54u));
+        Assert.That(MultiSync.Linux.Input.LinuxKeyMap.FromX11KeyCode(54u), Is.EqualTo(0x43));
+
+        // Windows ABNT2 VK_OEM_1 (0xBA, 'ç') and VK_LCONTROL (0xA2)
+        Assert.That(MultiSync.Linux.Input.LinuxKeyMap.ToEvdevCode(0xBA), Is.EqualTo(39));
+        Assert.That(MultiSync.Linux.Input.LinuxKeyMap.ToEvdevCode(0xA2), Is.EqualTo(29));
+
+        // HMAC compatibility between MultiSync.Core (Windows) and MultiSync.Linux
+        var winMac = ConfigStore.ComputeHmacHex("shared-key-42", "audio|pc-a|1700000000|start-send|192.168.2.5|5053");
+        var linMac = MultiSync.Linux.Protocol.ConfigStore.ComputeHmacHex("shared-key-42", "audio|pc-a|1700000000|start-send|192.168.2.5|5053");
+        Assert.That(linMac, Is.EqualTo(winMac));
+    }
 }

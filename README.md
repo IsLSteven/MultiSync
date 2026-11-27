@@ -6,9 +6,9 @@
 *Um mouse, um teclado, um fone de ouvido, área de transferência universal, transferência de arquivos em alta velocidade e visualização de telas ao vivo (até 1080p 60 FPS) na sua rede local.*
 
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-512BD4?style=for-the-badge&logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
-[![Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#como-compilar)
-[![Linux](https://img.shields.io/badge/Linux-Em%20Desenvolvimento-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#roadmap)
-[![Versão](https://img.shields.io/badge/Vers%C3%A3o-v0.5.1-10B981?style=for-the-badge)](#)
+[![Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#como-compilar-windows)
+[![Linux](https://img.shields.io/badge/Linux-Debian%20%7C%20Mint%20%7C%20Ubuntu%20%7C%20Arch-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#suporte-para-linux-debian-mint-ubuntu-e-arch)
+[![Versão](https://img.shields.io/badge/Vers%C3%A3o-v0.6.0-10B981?style=for-the-badge)](#)
 [![Zero Latência](https://img.shields.io/badge/KVM-250Hz%20%2B%20TLS%201.3-2563EB?style=for-the-badge)](#arquitetura-e-portas)
 
 <br/>
@@ -34,7 +34,7 @@ O **MultiSync** conecta dois ou mais computadores na mesma rede local (cabo ou W
 | **🎧 Áudio Compartilhado (1 Fone nos 2 PCs)** | Captura o áudio do outro PC via **WASAPI Loopback** e reproduz no seu fone em tempo real (`48 kHz Estéreo` via UDP `5053`), com controle de volume (0–150%) e mute. | ✅ Pronto |
 | **🪟 Espelhamento de Tela (`Ver Tela / PiP`)** | Abra a tela do PC 2 dentro de uma janela no PC 1 (e vice-versa) com perfis até **`1080p • 60 FPS (Ultra)`**, modo **Sempre no Topo (PiP)**, **Tela Cheia (F11)** e **Controle Direto**. | ✅ Pronto |
 | **📂 Arrastar e Soltar Arquivos na Tela Remota** | Arraste arquivos ou pastas e solte diretamente sobre a janela `Ver Tela (PiP)` para enviá-los ao outro computador em alta velocidade. | ✅ Pronto |
-| **🐧 Suporte Cross-Platform para Linux** | Interoperabilidade completa Windows ↔ Linux (X11 / Wayland / `uinput` + PipeWire/PulseAudio). | 🚧 Próximo |
+| **🐧 Suporte Cross-Platform para Linux** | Interoperabilidade completa **Windows ↔ Linux** (Debian, Linux Mint, Ubuntu e Arch Linux) via `/dev/uinput` (X11 + Wayland), `libX11/XTest`, PipeWire/PulseAudio, `xclip`/`wl-clipboard` e painel visual local. | ✅ Pronto |
 
 ---
 
@@ -102,8 +102,10 @@ MultiSync/
 │   ├── ScreenShare/    # ScreenStreamEngine (captura otimizada até 1080p 60 FPS)
 │   ├── Topology/       # TopologyCompiler (grafo direcional + coordenadas de borda)
 │   └── Win32/          # Raw Input, Hooks LL, Fullscreen Guard e SystemInputService (WinSta0)
-├── MultiSync.App/      # Interface WPF escura, RemoteScreenWindow (PiP) e System Tray
-├── MultiSync.Tests/    # Testes automatizados (NUnit)
+├── MultiSync.App/      # Interface WPF escura, RemoteScreenWindow (PiP) e System Tray (Windows)
+├── MultiSync.Linux/    # Cliente/Servidor nativo para Debian, Mint, Ubuntu e Arch (uinput/X11, PipeWire/PulseAudio, Web UI local)
+├── MultiSync.Tests/    # Testes automatizados (NUnit — incluindo interoperabilidade Windows ↔ Linux)
+├── scripts/            # Instalador universal para Linux (install-linux.sh)
 └── docs/assets/        # Imagens e GIF animado da interface
 ```
 
@@ -117,11 +119,44 @@ Requisitos: **.NET 10 SDK** no Windows 10/11 (x64).
 # Rodar testes automatizados
 dotnet test MultiSync.sln -c Release
 
-# Gerar executável único (self-contained — não precisa de .NET instalado no PC de destino)
+# Gerar executável único para Windows (self-contained)
 dotnet publish MultiSync.App\MultiSync.App.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+
+# (Opcional) Compilar o binário Linux (linux-x64) direto do Windows
+dotnet publish MultiSync.Linux\MultiSync.Linux.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-linux
 ```
 
-O executável final será gerado em `publish\MultiSync.exe`.
+O executável Windows é gerado em `publish\MultiSync.exe` e o executável Linux em `publish-linux\multisync-linux`.
+
+---
+
+## 🐧 Suporte para Linux (Debian, Mint, Ubuntu e Arch)
+
+O **MultiSync Linux** (`MultiSync.Linux`) conversa **100% nativamente** com o MultiSync Windows (e entre máquinas Linux) usando exatamente os mesmos protocolos e portas (`5050`–`5053`):
+
+- **Input KVM (X11 + Wayland):** usa `/dev/uinput` nativo (funciona em X11 e Wayland sem processos externos) com fallback automático para `libX11 / libXtst` (funciona de imediato no Mint, Debian, Ubuntu X11 e Arch X11).
+- **Área de Transferência & Arquivos:** suporte automático a `wl-clipboard` (Wayland) e `xclip` (X11) + transferência dedicada de arquivos (`256 KB`) salva em `~/Downloads/MultiSync` pronta para `Ctrl+V`.
+- **Áudio Compartilhado (`UDP 5053`):** integração direta com **PipeWire** e **PulseAudio** (`parec` / `paplay`) compatível em tempo real com o WASAPI do Windows.
+- **Espelhamento de Tela (`Ver Tela / PiP`):** captura ao vivo via `ffmpeg` (`x11grab`) / `grim` (Wayland) até **1080p 60 FPS** + visualizador integrado no painel local (`http://127.0.0.1:5055`).
+
+### Instalação rápida (Debian, Linux Mint, Ubuntu e Arch Linux)
+
+```bash
+git clone https://github.com/IsLSteven/MultiSync.git
+cd MultiSync
+chmod +x scripts/install-linux.sh
+./scripts/install-linux.sh
+```
+
+O script detecta automaticamente `apt` (**Debian / Mint / Ubuntu**) ou `pacman` (**Arch Linux**), instala os utilitários necessários, configura as permissões de `/dev/uinput` (`udev`), libera as portas no firewall (`ufw`/`firewalld`), instala `~/.local/bin/multisync` e cria o atalho + serviço `systemd --user`.
+
+```bash
+# Abrir com o painel visual (http://127.0.0.1:5055)
+~/.local/bin/multisync
+
+# Ou iniciar automaticamente em segundo plano no login
+systemctl --user enable --now multisync
+```
 
 ---
 
@@ -134,4 +169,4 @@ O executável final será gerado em `publish\MultiSync.exe`.
 - [x] `Ctrl+C` / `Ctrl+V` bidirecional (texto, imagens e transferência dedicada de arquivos até 2 GB)
 - [x] Áudio compartilhado em tempo real (WASAPI Loopback → 1 fone para os 2 PCs)
 - [x] Espelhamento de tela bidirecional (PiP, Tela Cheia, Controle Direto, `1080p 60 FPS Ultra` e Drag & Drop de arquivos)
-- [ ] **Suporte completo para Linux (`MultiSync.Linux`)** com interoperabilidade total Windows ↔ Linux
+- [x] **Suporte completo para Linux (`MultiSync.Linux` — Debian, Mint, Ubuntu e Arch)** com interoperabilidade total Windows ↔ Linux

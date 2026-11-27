@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <LangVersion>13</LangVersion>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <AssemblyName>multisync-linux</AssemblyName>
+        <Product>MultiSync Linux</Product>
+        <Version>0.6.0</Version>
+        <Description>MultiSync para Linux (Debian, Mint, Ubuntu e Arch) — KVM, Áudio, Arquivos e Espelhamento de Tela</Description>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    </PropertyGroup>
+
+</Project>
