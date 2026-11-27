@@ -28,6 +28,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _audioMeterTimer;
     private readonly List<DeviceNode> _nodes = [];
     private readonly Dictionary<string, string> _pinInputs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RemoteScreenWindow> _openScreenWindows = new(StringComparer.OrdinalIgnoreCase);
 
     private DeviceNode? _draggingNode;
     private Border? _draggingCard;
@@ -82,6 +83,11 @@ public partial class MainWindow : Window
         }
         _timer.Stop();
         _audioMeterTimer.Stop();
+        foreach (var w in _openScreenWindows.Values.ToList())
+        {
+            try { w.Close(); } catch { }
+        }
+        _openScreenWindows.Clear();
         base.OnClosing(e);
     }
 
@@ -324,6 +330,20 @@ public partial class MainWindow : Window
                 stack.Children.Add(pairGrid);
             }
 
+            if (peer.IsPaired && !string.IsNullOrWhiteSpace(peer.IpAddress))
+            {
+                var viewBtn = new System.Windows.Controls.Button
+                {
+                    Content = "🖥️ Ver Tela (PiP)",
+                    Style = (Style)FindResource("PrimaryButton"),
+                    Padding = new Thickness(8, 5, 8, 5),
+                    FontSize = 11.5,
+                    Margin = new Thickness(0, 0, 0, 6),
+                };
+                viewBtn.Click += (_, _) => OpenRemoteScreenWindow(peer.Name, peer.IpAddress, peer.ControlPort);
+                stack.Children.Add(viewBtn);
+            }
+
             if (!_nodes.Any(n => string.Equals(n.Name, peer.Name, StringComparison.OrdinalIgnoreCase)))
             {
                 var addBtn = new System.Windows.Controls.Button
@@ -472,6 +492,26 @@ public partial class MainWindow : Window
 
         if (!node.IsLocal)
         {
+            var topBtns = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+            if (!string.IsNullOrWhiteSpace(node.IpAddress))
+            {
+                var viewCardBtn = new System.Windows.Controls.Button
+                {
+                    Content = "🖥️",
+                    FontSize = 10.5,
+                    Padding = new Thickness(5, 1, 5, 1),
+                    Margin = new Thickness(0, 0, 4, 0),
+                    ToolTip = $"Abrir tela de {node.Name} em uma janela ao vivo (PiP)",
+                    Style = (Style)FindResource("ModernButton"),
+                };
+                viewCardBtn.Click += (_, e) =>
+                {
+                    e.Handled = true;
+                    OpenRemoteScreenWindow(node.Name, node.IpAddress, _coordinator.Store.GetSnapshot().ControlPort);
+                };
+                topBtns.Children.Add(viewCardBtn);
+            }
+
             var rmBtn = new System.Windows.Controls.Button
             {
                 Content = "✕",
@@ -487,8 +527,9 @@ public partial class MainWindow : Window
                 UnsavedHintText.Visibility = Visibility.Visible;
                 RenderCanvas();
             };
-            Grid.SetColumn(rmBtn, 1);
-            topRow.Children.Add(rmBtn);
+            topBtns.Children.Add(rmBtn);
+            Grid.SetColumn(topBtns, 1);
+            topRow.Children.Add(topBtns);
         }
         else
         {
@@ -924,6 +965,29 @@ public partial class MainWindow : Window
         var pct = (int)Math.Round(e.NewValue);
         AudioVolumeText.Text = $"{pct}%";
         _coordinator.Audio.Volume = (float)(e.NewValue / 100.0);
+    }
+
+    private void OpenRemoteScreenWindow(string peerName, string peerIp, int controlPort)
+    {
+        if (string.IsNullOrWhiteSpace(peerIp))
+        {
+            SetStatus($"Sem IP conhecido para abrir a tela de '{peerName}'.", isWarning: true);
+            return;
+        }
+
+        if (_openScreenWindows.TryGetValue(peerName, out var existing) && existing.IsLoaded)
+        {
+            if (existing.WindowState == WindowState.Minimized)
+                existing.WindowState = WindowState.Normal;
+            existing.Activate();
+            return;
+        }
+
+        var win = new RemoteScreenWindow(_coordinator, peerName, peerIp, controlPort > 0 ? controlPort : _coordinator.Store.GetSnapshot().ControlPort);
+        win.Closed += (_, _) => _openScreenWindows.Remove(peerName);
+        _openScreenWindows[peerName] = win;
+        win.Show();
+        SetStatus($"🖥️ Abrindo tela ao vivo de '{peerName}' ({peerIp})...");
     }
 
     private void SetStatus(string msg, bool isWarning = false)

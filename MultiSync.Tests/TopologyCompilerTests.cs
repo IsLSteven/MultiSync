@@ -2,6 +2,7 @@ using MultiSync.Core.Audio;
 using MultiSync.Core.ClipboardSync;
 using MultiSync.Core.Discovery;
 using MultiSync.Core.Models;
+using MultiSync.Core.ScreenShare;
 using MultiSync.Core.Topology;
 using NAudio.Wave;
 using NUnit.Framework;
@@ -182,5 +183,21 @@ public class TopologyCompilerTests
             try { Directory.Delete(tempSrc, recursive: true); } catch { }
             try { File.Delete(tempCfg); } catch { }
         }
+    }
+
+    [Test]
+    public void ScreenStreamEngine_EncodesAndScalesValidJpegFrame()
+    {
+        using var bmp = new System.Drawing.Bitmap(1920, 1080, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+        using (var g = System.Drawing.Graphics.FromImage(bmp))
+            g.Clear(System.Drawing.Color.DarkSlateBlue);
+
+        var frame = ScreenStreamEngine.EncodeBitmapToJpeg(bmp, maxWidth: 640, jpegQuality: 65);
+        Assert.That(frame.SourceWidth, Is.EqualTo(1920));
+        Assert.That(frame.SourceHeight, Is.EqualTo(1080));
+        Assert.That(frame.JpegBytes.Length, Is.GreaterThan(100));
+        // JPEG magic bytes FF D8
+        Assert.That(frame.JpegBytes[0], Is.EqualTo(0xFF));
+        Assert.That(frame.JpegBytes[1], Is.EqualTo(0xD8));
     }
 }

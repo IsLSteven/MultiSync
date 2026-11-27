@@ -14,7 +14,7 @@
         <StartupObject>MultiSync.App.Program</StartupObject>
         <AssemblyName>MultiSync</AssemblyName>
         <Product>MultiSync</Product>
-        <Version>0.4.1</Version>
+        <Version>0.5.0</Version>
         <Description>MultiSync — Plataforma integrada de controle Multi-PC para Windows</Description>
         <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     </PropertyGroup>

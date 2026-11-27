@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using MultiSync.Core.ClipboardSync;
 using MultiSync.Core.Models;
+using MultiSync.Core.ScreenShare;
 
 namespace MultiSync.Core.Discovery;
 
@@ -276,6 +277,53 @@ public sealed class LanDiscoveryAndControlService : IDisposable
         var finalAck = await ReadFrameAsync<ControlAckMessage>(stream, cancel);
         if (!finalAck.Success)
             throw new InvalidOperationException(finalAck.Error ?? "Erro ao concluir transferência no destino.");
+    }
+
+    /// <summary>
+    /// Opens an authenticated live screen-mirroring TCP connection to a peer on ControlPort.
+    /// Caller owns and must dispose the returned TcpClient and NetworkStream.
+    /// </summary>
+    public static async Task<(TcpClient Tcp, NetworkStream Stream)> ConnectScreenStreamAsync(
+        string targetIp,
+        int controlPort,
+        string senderName,
+        string sessionKey,
+        ScreenStreamPreset preset,
+        CancellationToken cancel = default)
+    {
+        var (maxW, fps, quality) = ScreenStreamEngine.GetPresetParams(preset);
+        var tcp = new TcpClient
+        {
+            NoDelay = true,
+            ReceiveBufferSize = 512 * 1024,
+            SendBufferSize = 64 * 1024,
+        };
+        try
+        {
+            using (var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancel))
+            {
+                connectTimeout.CancelAfter(TimeSpan.FromSeconds(6));
+                await tcp.ConnectAsync(targetIp, controlPort, connectTimeout.Token);
+            }
+
+            var stream = tcp.GetStream();
+            var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var sig = ConfigStore.ComputeHmacHex(sessionKey, $"screen|{senderName.ToLowerInvariant()}|{ts}|{maxW}|{fps}|{quality}");
+            var req = new ScreenStreamRequest(senderName, ts, maxW, fps, quality, sig);
+            var env = new RpcEnvelope("screen-stream", JsonSerializer.Serialize(req, ConfigStore.JsonOptions));
+            await WriteFrameAsync(stream, env, cancel);
+
+            var ack = await ReadFrameAsync<ControlAckMessage>(stream, cancel);
+            if (!ack.Success)
+                throw new InvalidOperationException(ack.Error ?? $"Peer {targetIp} recusou o espelhamento de tela.");
+
+            return (tcp, stream);
+        }
+        catch
+        {
+            tcp.Dispose();
+            throw;
+        }
     }
 
     private LanDeviceBeacon BuildLocalBeacon(string kind)
@@ -604,6 +652,32 @@ public sealed class LanDiscoveryAndControlService : IDisposable
 
                 _onFilesReceived?.Invoke(topPaths);
                 await WriteFrameAsync(stream, new ControlAckMessage(true), serverCancel);
+            }
+            else if (env.Method == "screen-stream")
+            {
+                var req = JsonSerializer.Deserialize<ScreenStreamRequest>(env.BodyJson, ConfigStore.JsonOptions)!;
+                var localCfg = _store.GetSnapshot();
+
+                var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (Math.Abs(now - req.UnixSeconds) > 120)
+                {
+                    await WriteFrameAsync(stream, new ControlAckMessage(false, "Timestamp expirado."), timeout.Token);
+                    return;
+                }
+
+                var expectedSig = ConfigStore.ComputeHmacHex(
+                    localCfg.SessionKey,
+                    $"screen|{req.SenderName.ToLowerInvariant()}|{req.UnixSeconds}|{req.MaxWidth}|{req.TargetFps}|{req.JpegQuality}");
+                if (!ConfigStore.FixedTimeEquals(expectedSig, req.SignatureHex))
+                {
+                    await WriteFrameAsync(stream, new ControlAckMessage(false, "Chave de sessão inválida para espelhamento de tela."), timeout.Token);
+                    return;
+                }
+
+                client.NoDelay = true;
+                client.SendBufferSize = 512 * 1024;
+                await WriteFrameAsync(stream, new ControlAckMessage(true), timeout.Token);
+                await ScreenStreamEngine.ServeStreamAsync(stream, req.MaxWidth, req.TargetFps, req.JpegQuality, serverCancel);
             }
         }
     }
