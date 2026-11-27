@@ -12,6 +12,7 @@ public enum ScreenStreamPreset
     Balanced720p30 = 0,
     Sharp1080p30 = 1,
     Smooth720p60 = 2,
+    Ultra1080p60 = 3,
 }
 
 public sealed record ScreenStreamRequest(
@@ -45,7 +46,8 @@ public static class ScreenStreamEngine
     public static (int MaxWidth, int TargetFps, int JpegQuality) GetPresetParams(ScreenStreamPreset preset) => preset switch
     {
         ScreenStreamPreset.Sharp1080p30 => (1920, 30, 76),
-        ScreenStreamPreset.Smooth720p60 => (1280, 60, 62),
+        ScreenStreamPreset.Smooth720p60 => (1280, 60, 64),
+        ScreenStreamPreset.Ultra1080p60 => (1920, 60, 72),
         _ => (1280, 30, 70),
     };
 
@@ -153,36 +155,50 @@ public static class ScreenStreamEngine
 
         var frameIntervalMs = 1000.0 / targetFps;
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var capturer = new ReusableScreenCapturer(maxWidth, jpegQuality);
+        var packetBuf = new byte[256 * 1024];
+
+        // Request 1 ms Windows timer resolution while streaming so 60 FPS pacing is accurate (otherwise Task.Delay rounds to 15.6 ms)
+        var highResTimer = timeBeginPeriod(1) == 0;
+        var nextFrameMs = sw.Elapsed.TotalMilliseconds;
 
         try
         {
             while (!token.IsCancellationRequested)
             {
-                var startMs = sw.Elapsed.TotalMilliseconds;
-                ScreenFramePacket frame;
+                int srcW, srcH, jpegLen;
+                byte[] jpegBacking;
                 try
                 {
-                    frame = CaptureScreenJpeg(maxWidth, jpegQuality);
+                    (srcW, srcH, jpegBacking, jpegLen) = capturer.CaptureToReusableBuffer();
                 }
                 catch (System.ComponentModel.Win32Exception)
                 {
                     // Transient desktop switch (e.g., UAC or Lock Screen): keep stream alive and retry shortly
                     await Task.Delay(120, token);
+                    nextFrameMs = sw.Elapsed.TotalMilliseconds;
                     continue;
                 }
 
-                var packet = new byte[1 + 4 + 4 + 4 + frame.JpegBytes.Length];
-                packet[0] = MsgFrame;
-                BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(1, 4), 8 + frame.JpegBytes.Length);
-                BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(5, 4), frame.SourceWidth);
-                BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(9, 4), frame.SourceHeight);
-                Buffer.BlockCopy(frame.JpegBytes, 0, packet, 13, frame.JpegBytes.Length);
+                var totalLen = 13 + jpegLen;
+                if (packetBuf.Length < totalLen)
+                    packetBuf = new byte[Math.Max(totalLen, packetBuf.Length * 2)];
 
-                await stream.WriteAsync(packet, token);
+                packetBuf[0] = MsgFrame;
+                BinaryPrimitives.WriteInt32BigEndian(packetBuf.AsSpan(1, 4), 8 + jpegLen);
+                BinaryPrimitives.WriteInt32BigEndian(packetBuf.AsSpan(5, 4), srcW);
+                BinaryPrimitives.WriteInt32BigEndian(packetBuf.AsSpan(9, 4), srcH);
+                Buffer.BlockCopy(jpegBacking, 0, packetBuf, 13, jpegLen);
 
-                var elapsed = sw.Elapsed.TotalMilliseconds - startMs;
-                var sleepMs = (int)(frameIntervalMs - elapsed);
-                if (sleepMs > 1)
+                await stream.WriteAsync(packetBuf.AsMemory(0, totalLen), token);
+
+                nextFrameMs += frameIntervalMs;
+                var nowMs = sw.Elapsed.TotalMilliseconds;
+                if (nextFrameMs < nowMs - frameIntervalMs)
+                    nextFrameMs = nowMs;
+
+                var sleepMs = (int)(nextFrameMs - nowMs);
+                if (sleepMs > 0)
                     await Task.Delay(sleepMs, token);
             }
         }
@@ -192,6 +208,7 @@ public static class ScreenStreamEngine
         }
         finally
         {
+            if (highResTimer) timeEndPeriod(1);
             linkedCts.Cancel();
             try { await inputTask; } catch { }
         }
@@ -362,4 +379,102 @@ public static class ScreenStreamEngine
     [DllImport("gdi32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DeleteObject(nint hObject);
+
+    [DllImport("winmm.dll")]
+    private static extern uint timeBeginPeriod(uint uPeriod);
+
+    [DllImport("winmm.dll")]
+    private static extern uint timeEndPeriod(uint uPeriod);
+
+    /// <summary>
+    /// Reuses GDI Bitmaps, Graphics contexts, EncoderParameters, and MemoryStream across frames
+    /// to eliminate hundreds of MB/s of GC allocations during 1080p 60 FPS streaming.
+    /// </summary>
+    private sealed class ReusableScreenCapturer : IDisposable
+    {
+        private readonly int _maxWidth;
+        private readonly EncoderParameters _encParams;
+        private readonly MemoryStream _jpegStream = new(256 * 1024);
+
+        private Bitmap? _fullBmp;
+        private Graphics? _fullGraphics;
+        private Bitmap? _scaledBmp;
+        private Graphics? _scaledGraphics;
+        private int _lastW;
+        private int _lastH;
+
+        public ReusableScreenCapturer(int maxWidth, int jpegQuality)
+        {
+            _maxWidth = maxWidth;
+            _encParams = new EncoderParameters(1);
+            _encParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, Math.Clamp(jpegQuality, 30, 95));
+        }
+
+        public (int SrcWidth, int SrcHeight, byte[] Buffer, int Length) CaptureToReusableBuffer()
+        {
+            var bounds = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080);
+            var srcW = Math.Max(1, bounds.Width);
+            var srcH = Math.Max(1, bounds.Height);
+
+            EnsureBuffers(srcW, srcH);
+
+            _fullGraphics!.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, new Size(srcW, srcH), CopyPixelOperation.SourceCopy);
+            DrawSystemCursor(_fullGraphics, bounds.Left, bounds.Top);
+
+            Bitmap encodeTarget = _fullBmp!;
+            if (_scaledBmp != null && _scaledGraphics != null)
+            {
+                _scaledGraphics.DrawImage(_fullBmp!, 0, 0, _scaledBmp.Width, _scaledBmp.Height);
+                encodeTarget = _scaledBmp;
+            }
+
+            _jpegStream.SetLength(0);
+            encodeTarget.Save(_jpegStream, JpegCodec, _encParams);
+            return (srcW, srcH, _jpegStream.GetBuffer(), (int)_jpegStream.Length);
+        }
+
+        private void EnsureBuffers(int srcW, int srcH)
+        {
+            if (_fullBmp != null && _lastW == srcW && _lastH == srcH)
+                return;
+
+            DisposeBitmaps();
+            _lastW = srcW;
+            _lastH = srcH;
+
+            _fullBmp = new Bitmap(srcW, srcH, PixelFormat.Format24bppRgb);
+            _fullGraphics = Graphics.FromImage(_fullBmp);
+
+            if (_maxWidth > 0 && srcW > _maxWidth)
+            {
+                var scale = (double)_maxWidth / srcW;
+                var dstW = _maxWidth;
+                var dstH = Math.Max(1, (int)Math.Round(srcH * scale));
+                _scaledBmp = new Bitmap(dstW, dstH, PixelFormat.Format24bppRgb);
+                _scaledGraphics = Graphics.FromImage(_scaledBmp);
+                _scaledGraphics.CompositingQuality = CompositingQuality.HighSpeed;
+                _scaledGraphics.InterpolationMode = InterpolationMode.Bilinear;
+                _scaledGraphics.SmoothingMode = SmoothingMode.None;
+            }
+        }
+
+        private void DisposeBitmaps()
+        {
+            _scaledGraphics?.Dispose();
+            _scaledGraphics = null;
+            _scaledBmp?.Dispose();
+            _scaledBmp = null;
+            _fullGraphics?.Dispose();
+            _fullGraphics = null;
+            _fullBmp?.Dispose();
+            _fullBmp = null;
+        }
+
+        public void Dispose()
+        {
+            DisposeBitmaps();
+            _encParams.Dispose();
+            _jpegStream.Dispose();
+        }
+    }
 }

@@ -295,7 +295,7 @@ public sealed class LanDiscoveryAndControlService : IDisposable
         var tcp = new TcpClient
         {
             NoDelay = true,
-            ReceiveBufferSize = 512 * 1024,
+            ReceiveBufferSize = 1024 * 1024,
             SendBufferSize = 64 * 1024,
         };
         try
@@ -675,7 +675,7 @@ public sealed class LanDiscoveryAndControlService : IDisposable
                 }
 
                 client.NoDelay = true;
-                client.SendBufferSize = 512 * 1024;
+                client.SendBufferSize = 1024 * 1024;
                 await WriteFrameAsync(stream, new ControlAckMessage(true), timeout.Token);
                 await ScreenStreamEngine.ServeStreamAsync(stream, req.MaxWidth, req.TargetFps, req.JpegQuality, serverCancel);
             }

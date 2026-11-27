@@ -188,6 +188,10 @@ public class TopologyCompilerTests
     [Test]
     public void ScreenStreamEngine_EncodesAndScalesValidJpegFrame()
     {
+        var ultra = ScreenStreamEngine.GetPresetParams(ScreenStreamPreset.Ultra1080p60);
+        Assert.That(ultra.MaxWidth, Is.EqualTo(1920));
+        Assert.That(ultra.TargetFps, Is.EqualTo(60));
+
         using var bmp = new System.Drawing.Bitmap(1920, 1080, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
         using (var g = System.Drawing.Graphics.FromImage(bmp))
             g.Clear(System.Drawing.Color.DarkSlateBlue);

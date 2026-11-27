@@ -391,6 +391,7 @@ public partial class RemoteScreenWindow : Window
         {
             1 => ScreenStreamPreset.Sharp1080p30,
             2 => ScreenStreamPreset.Smooth720p60,
+            3 => ScreenStreamPreset.Ultra1080p60,
             _ => ScreenStreamPreset.Balanced720p30,
         };
         StartStreamingLoop();

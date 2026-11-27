@@ -106,12 +106,13 @@
                 </StackPanel>
 
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                    <ComboBox x:Name="QualityCombo" Width="138" Height="26" Margin="0,0,8,0"
+                    <ComboBox x:Name="QualityCombo" Width="154" Height="26" Margin="0,0,8,0"
                               FontSize="11.5" SelectedIndex="0"
                               SelectionChanged="OnQualitySelectionChanged">
                         <ComboBoxItem Content="720p • 30 FPS (Padrão)"/>
                         <ComboBoxItem Content="1080p • 30 FPS (Nítido)"/>
                         <ComboBoxItem Content="720p • 60 FPS (Suave)"/>
+                        <ComboBoxItem Content="1080p • 60 FPS (Ultra)"/>
                     </ComboBox>
 
                     <ToggleButton x:Name="ControlToggle" Content="🖱️ Controlar aqui" Style="{StaticResource ToolbarToggle}"
